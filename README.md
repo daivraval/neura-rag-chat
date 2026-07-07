@@ -6,17 +6,17 @@ An end-to-end **Retrieval-Augmented Generation (RAG)** project: index a PDF into
 
 ## Features
 
-- **Grounded Q&A** — retrieves the most relevant passages using **MMR (maximal marginal relevance)** search over a Chroma vector store, then answers with `Qwen/Qwen2.5-7B-Instruct` via the Hugging Face Inference API
-- **Custom frontend** — particle-field canvas, aurora gradients, and glassmorphism, served straight from FastAPI (no build step)
-- **Persistent chat history** — conversations stored in SQLite and restored in the sidebar
-- **Local embeddings** — `sentence-transformers/all-MiniLM-L6-v2` runs on your machine, so indexing is free
+- **Grounded Q&A** : retrieves the most relevant passages using **MMR (maximal marginal relevance)** search over a Chroma vector store, then answers with `Qwen/Qwen2.5-7B-Instruct` via the Hugging Face Inference API
+- **Custom frontend** : particle-field canvas, aurora gradients, and glassmorphism, served straight from FastAPI (no build step)
+- **Persistent chat history** : conversations stored in SQLite and restored in the sidebar
+- **Local embeddings** : `sentence-transformers/all-MiniLM-L6-v2` runs on your machine, so indexing is free
 
 ## Project structure
 
 | Path | What it is |
 |---|---|
 | `app.py` | FastAPI app: RAG pipeline + SQLite chat history + the NEURA frontend |
-| `create_database.py` | Indexing script: PDF → chunks → embeddings → Chroma |
+| `create_database.py` | Indexing script: PDF -> chunks -> embeddings -> Chroma |
 | `main.py` | CLI version of the RAG pipeline |
 | `1_document_loaders/` | Document loading & text-splitting experiments (PDF, web pages) |
 | `Retrievers/` | Retriever experiments: MMR, multi-query, ArXiv |
@@ -58,9 +58,9 @@ Open http://127.0.0.1:8000 and start asking questions.
 ## How it works
 
 ```
-PDF ──▶ RecursiveCharacterTextSplitter ──▶ MiniLM embeddings ──▶ Chroma
+PDF -> RecursiveCharacterTextSplitter -> MiniLM embeddings -> Chroma
                                                                     │
-User question ──▶ MMR retrieval (k=4) ──▶ context + prompt ──▶ Qwen 2.5 7B ──▶ grounded answer
+User question -> MMR retrieval (k=4) -> context + prompt -> Qwen 2.5 7B -> grounded answer
 ```
 
 ## Tech stack
