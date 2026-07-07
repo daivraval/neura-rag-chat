@@ -53,7 +53,6 @@ python create_database.py
 python app.py
 ```
 
-Open http://127.0.0.1:8000 and start asking questions.
 
 ## How it works
 
