@@ -1,0 +1,28 @@
+# Secrets — never commit
+.env
+*.env
+
+# Virtual environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings
+.claude/
+
+# Generated vector DB
+chroma_db/
+
+# Local chat history
+chat_history.db
