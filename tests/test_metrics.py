@@ -7,6 +7,8 @@ from evals.run_eval import load_golden
 def test_normalize_folds_ligatures_hyphenation_and_whitespace():
     assert M.normalize("ﬁgure-of-merit\n  is  ﬁne") == "figure-of-merit is fine"
     assert M.normalize("re-\ntriever model") == "retriever model"
+    # models write non-breaking hyphens and thin spaces
+    assert M.normalize("top‑k over 21 015 324 passages") == "top-k over 21 015 324 passages"
 
 
 def test_evidence_rank_is_one_based_and_normalized():

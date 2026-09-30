@@ -10,7 +10,7 @@ def clean_env(monkeypatch):
 
 
 def test_defaults_to_groq_preset():
-    assert pipeline.resolve_llm() == ("groq", "llama-3.3-70b-versatile")
+    assert pipeline.resolve_llm() == ("groq", "openai/gpt-oss-120b")
 
 
 def test_env_picks_provider_and_model(monkeypatch):
@@ -48,6 +48,7 @@ def test_missing_key_names_the_variable():
 def test_client_points_at_the_provider(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
     llm = pipeline.make_llm(max_new_tokens=50)
-    assert llm.model_name == "llama-3.3-70b-versatile"
+    assert llm.model_name == "openai/gpt-oss-120b"
     assert llm.openai_api_base == "https://api.groq.com/openai/v1"
-    assert llm.temperature == 0 and llm.max_tokens == 50
+    assert llm.temperature == 0 and llm.reasoning_effort == "low"
+    assert llm.max_tokens == 50 + pipeline.REASONING_BUDGET  # room to think first

@@ -427,9 +427,8 @@ details.src .snip{margin-top:.6rem;font-family:'JetBrains Mono',monospace;font-s
       <div id="hero">
         <h1>Ask your documents<br><span class="grad">anything at all.</span></h1>
         <p>NEURA retrieves the most relevant passages from your indexed PDFs using
-           maximal-marginal-relevance search over a Chroma vector store, then answers
-           with a grounded language model. No hallucinations  if it isn't in the
-           document, it says so.</p>
+           similarity search over a Chroma vector store, then answers with a
+           grounded language model. If the answer isn't in the document, it says so.</p>
         <div class="chips">
           <div class="chip">Summarize the document</div>
           <div class="chip">What are the key findings?</div>

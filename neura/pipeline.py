@@ -20,7 +20,7 @@ PROVIDERS = {
     "groq": {
         "base_url": "https://api.groq.com/openai/v1",
         "key_env": "GROQ_API_KEY",
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
     },
     "huggingface": {
         "base_url": "https://router.huggingface.co/v1",
@@ -34,12 +34,15 @@ PROVIDERS = {
     },
 }
 DEFAULT_PROVIDER = "groq"
+REASONING_BUDGET = 512  # extra max_tokens for reasoning models (gpt-oss)
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
-# The retrieval settings the app ships with.
-RETRIEVAL = {"search_type": "mmr", "k": 4, "fetch_k": 10, "lambda_mult": 0.5}
+# The retrieval settings the app ships with. Plain similarity beat MMR
+# (fetch_k=10, lambda=0.5) in the eval: 83% vs 69% evidence hit@4, 85.7% vs
+# 78.6% answer accuracy — see evals/results/.
+RETRIEVAL = {"search_type": "similarity", "k": 4}
 
 REFUSAL = "I could not find the answer in the document."
 SYSTEM_PROMPT = (
@@ -136,6 +139,11 @@ def make_llm(max_new_tokens=400, provider=None, model=None, **extra):
     api_key = os.getenv(preset["key_env"])
     if not api_key:
         raise RuntimeError(f"{preset['key_env']} is not set (needed for LLM provider {provider!r}) — see .env.example")
+    if "gpt-oss" in model:
+        # Reasoning model: thinking tokens count against max_tokens, so keep
+        # the thinking short and budget for it on top of the answer.
+        extra.setdefault("reasoning_effort", "low")
+        max_new_tokens += REASONING_BUDGET
     return ChatOpenAI(
         model=model,
         base_url=preset["base_url"],

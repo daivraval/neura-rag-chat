@@ -5,6 +5,7 @@ whether it answers (or refuses) correctly.
     python -m evals.run_eval validate                 # self-check the golden set
     python -m evals.run_eval retrieval                # offline, compares retrieval configs
     python -m evals.run_eval generation [--judge]     # full pipeline, needs an LLM key (GROQ_API_KEY by default)
+    python -m evals.run_eval rescore <results.json>   # re-grade saved answers, no model calls
 
 Each run writes evals/results/<mode>.md (the report) and <mode>.json
 (every question, every retrieved page, every answer) so a regression can be
@@ -46,7 +47,8 @@ CONFIGS = {
         chunk_overlap=pipeline.CHUNK_OVERLAP,
         **pipeline.RETRIEVAL,
     ),
-    "similarity": dict(chunk_size=1000, chunk_overlap=200, search_type="similarity", k=4),
+    # The app's previous setting, kept as the baseline similarity replaced.
+    "mmr": dict(chunk_size=1000, chunk_overlap=200, search_type="mmr", k=4, fetch_k=10, lambda_mult=0.5),
     "mmr-0.8": dict(
         chunk_size=1000, chunk_overlap=200, search_type="mmr", k=4, fetch_k=20, lambda_mult=0.8
     ),
@@ -56,7 +58,7 @@ CONFIGS = {
 # Default judge per provider: a different model family from the default
 # answering model, so the judge isn't grading its own work.
 JUDGE_MODELS = {
-    "groq": "openai/gpt-oss-120b",
+    "groq": "qwen/qwen3.8-27b",
     "huggingface": "meta-llama/Llama-3.3-70B-Instruct",
 }
 JUDGE_SYSTEM = (
@@ -331,11 +333,7 @@ def cmd_generation(args):
             judge_provider, judge_model = pipeline.resolve_llm(
                 args.judge_provider or provider, args.judge_model or JUDGE_MODELS.get(args.judge_provider or provider)
             )
-            # Reasoning models spend tokens thinking before the one-word verdict.
-            reasoning = {"reasoning_effort": "low"} if "gpt-oss" in judge_model else {}
-            judge = pipeline.make_llm(
-                max_new_tokens=1024 if reasoning else 10, provider=judge_provider, model=judge_model, **reasoning
-            )
+            judge = pipeline.make_llm(max_new_tokens=10, provider=judge_provider, model=judge_model)
             judge_label = f"{judge_model} on {judge_provider}"
     except (ValueError, RuntimeError) as exc:
         sys.exit(str(exc))
@@ -372,14 +370,11 @@ def cmd_generation(args):
             continue
         row["latency_s"] = round(time.perf_counter() - t0, 2)
         row["answer"] = answer
-        row["refused"] = M.is_refusal(answer)
+        if q["answerable"]:
+            row["retrieved"] = M.evidence_rank([d.page_content for d in docs], q["evidence"]) is not None
+        grade(q, row)
 
         if q["answerable"]:
-            hits = M.keyword_hits(answer, q["expect"])
-            row["retrieved"] = M.evidence_rank([d.page_content for d in docs], q["evidence"]) is not None
-            row["fact_recall"] = sum(hits) / len(hits)
-            row["missing"] = [p for p, h in zip(q["expect"], hits) if not h]
-            row["correct"] = all(hits) and not row["refused"]
             if judge and not row["refused"]:
                 try:
                     reply = call_with_retry(
@@ -392,30 +387,50 @@ def cmd_generation(args):
                     row["faithful"] = M.parse_verdict(reply)
                 except Exception as exc:  # a judge failure shouldn't sink the answer
                     row["judge_error"] = str(exc)
-        else:
-            row["correct"] = row["refused"]
 
         rows.append(row)
         mark = "ok  " if row["correct"] else "FAIL"
         print(f"  [{i}/{len(questions)}] {q['id']} {mark} {row['latency_s']:.1f}s")
 
+    if not any("error" not in r for r in rows):
+        sys.exit("every question errored — no report written.")
+    meta = {"config": f"{args.config} ({describe(cfg)})", "model": f"{model} on {provider}", "judge": judge_label}
+    # One report per retrieval config + model, so runs can be compared side by side.
+    name = f"generation_{args.config}_{provider}_" + re.sub(r"[^a-z0-9.]+", "-", model.split("/")[-1].lower())
+    s = report_generation(name, rows, meta)
+    check_threshold(args, s["answer_accuracy"], "answer accuracy")
+
+
+def grade(q, row):
+    """Score one saved answer against its golden entry — no model calls."""
+    row["refused"] = M.is_refusal(row["answer"])
+    if q["answerable"]:
+        hits = M.keyword_hits(row["answer"], q["expect"])
+        row["fact_recall"] = sum(hits) / len(hits)
+        row["missing"] = [p for p, h in zip(q["expect"], hits) if not h]
+        row["correct"] = all(hits) and not row["refused"]
+    else:
+        row["correct"] = row["refused"]
+
+
+def report_generation(name, rows, meta):
+    judged = bool(meta["judge"])
+    judge_label = meta["judge"]
     done = [r for r in rows if "error" not in r]
     ans = [r for r in done if r["answerable"]]
     una = [r for r in done if not r["answerable"]]
     wrong = [r for r in ans if not r["correct"]]
     latencies = sorted(r["latency_s"] for r in done)
     s = {
-        "config": f"{args.config} ({describe(cfg)})",
-        "model": f"{model} on {provider}",
-        "judge": judge_label,
-        "judge_failures": sum(r.get("faithful") is None for r in ans if args.judge and not r["refused"]),
+        **meta,
+        "judge_failures": sum(r.get("faithful") is None for r in ans if judged and not r["refused"]),
         "answered": len(done),
         "errors": len(rows) - len(done),
         "answer_accuracy": M.mean([r["correct"] for r in ans]),
         "fact_recall": M.mean([r["fact_recall"] for r in ans]),
         "false_refusal_rate": M.mean([r["refused"] for r in ans]),
         "refusal_accuracy": M.mean([r["refused"] for r in una]),
-        "faithfulness": M.mean([r.get("faithful") for r in ans]) if args.judge else None,
+        "faithfulness": M.mean([r.get("faithful") for r in ans]) if judged else None,
         "wrong_retrieval_miss": sum(not r["retrieved"] for r in wrong),
         "wrong_generation_miss": sum(r["retrieved"] for r in wrong),
         "latency_s_p50": latencies[len(latencies) // 2] if latencies else None,
@@ -438,7 +453,7 @@ def cmd_generation(args):
                 ["Refusal accuracy", pct(s["refusal_accuracy"]), f"unanswerable questions ({len(una)}) correctly refused"],
                 ["Hallucination rate", pct(None if s["refusal_accuracy"] is None else 1 - s["refusal_accuracy"]), "unanswerable questions answered anyway"],
                 ["False refusal rate", pct(s["false_refusal_rate"]), "answerable questions wrongly refused"],
-                ["Faithfulness", pct(s["faithfulness"]) if args.judge else "not run (`--judge`)", f"answers the judge ({judge_label}) finds fully supported by the context"
+                ["Faithfulness", pct(s["faithfulness"]) if judged else "not run (`--judge`)", f"answers the judge ({judge_label}) finds fully supported by the context"
                  + (f"; {s['judge_failures']} verdicts unusable" if s["judge_failures"] else "")],
                 ["Latency p50 / p95", f"{s['latency_s_p50']} s / {s['latency_s_p95']} s", "LLM call only"],
                 ["Errors", s["errors"], "API failures after retries (excluded from metrics)"],
@@ -466,12 +481,23 @@ def cmd_generation(args):
         )
         answer = " ".join(r["answer"].split())
         md += [f"- **{r['id']}** — {r['question']} — _{why}_", f"  > {answer[:300]}{'…' if len(answer) > 300 else ''}"]
-    if not done:
-        sys.exit("every question errored — no report written.")
-    # One report per model, so candidates can be compared side by side.
-    name = f"generation_{provider}_" + re.sub(r"[^a-z0-9.]+", "-", model.split("/")[-1].lower())
     write_report(name, "\n".join(md) + "\n", {"generated": now(), "summary": s, "questions": rows})
-    check_threshold(args, s["answer_accuracy"], "answer accuracy")
+    return s
+
+
+def cmd_rescore(args):
+    """Re-grade saved answers after fixing the golden set or the scorer — no
+    model calls, so it's free and doesn't touch rate limits. Faithfulness
+    verdicts are kept as they were."""
+    with open(args.results, encoding="utf-8") as f:
+        saved = json.load(f)
+    golden = {q["id"]: q for q in load_golden()}
+    rows = saved["questions"]
+    for row in rows:
+        if "error" not in row:
+            grade(golden[row["id"]], row)
+    meta = {k: saved["summary"][k] for k in ("config", "model", "judge")}
+    report_generation(os.path.splitext(os.path.basename(args.results))[0], rows, meta)
 
 
 def check_threshold(args, value, label):
@@ -485,6 +511,8 @@ def main():
     parser = argparse.ArgumentParser(description="NEURA eval suite")
     sub = parser.add_subparsers(dest="mode", required=True)
     sub.add_parser("validate", help="self-check the golden set against the PDF")
+    rescore = sub.add_parser("rescore", help="re-grade a saved generation run without model calls")
+    rescore.add_argument("results", help="path to a generation_*.json file")
 
     for mode in ("retrieval", "generation"):
         p = sub.add_parser(mode)
@@ -502,7 +530,8 @@ def main():
     gen.add_argument("--sleep", type=float, default=0, help="seconds to pause between questions (rate limits)")
 
     args = parser.parse_args()
-    {"validate": cmd_validate, "retrieval": cmd_retrieval, "generation": cmd_generation}[args.mode](args)
+    modes = {"validate": cmd_validate, "retrieval": cmd_retrieval, "generation": cmd_generation, "rescore": cmd_rescore}
+    modes[args.mode](args)
 
 
 if __name__ == "__main__":

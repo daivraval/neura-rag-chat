@@ -20,10 +20,13 @@ REFUSAL_PATTERNS = [
 def normalize(text):
     """Canonical form for substring matching against PDF-extracted text.
 
-    NFKC folds ligatures (the PDF's "ﬁ" -> "fi"), "-\\n" re-joins words the
-    PDF hyphenated across lines, and all whitespace collapses to one space.
+    NFKC folds ligatures (the PDF's "ﬁ" -> "fi") and odd spaces, Unicode
+    dashes become "-" (models write "K‑means" with a non-breaking hyphen),
+    "-\\n" re-joins words the PDF hyphenated across lines, and all whitespace
+    collapses to one space.
     """
     text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[‐-―−]", "-", text)
     text = re.sub(r"-\s*\n\s*", "", text)
     return re.sub(r"\s+", " ", text).strip().lower()
 
