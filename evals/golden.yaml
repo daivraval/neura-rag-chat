@@ -1,0 +1,378 @@
+# NEURA golden set — questions about the indexed paper:
+#   "Dense Passage Retrieval for Open-Domain Question Answering"
+#   (Karpukhin et al., EMNLP 2020, CC BY 4.0) — 1_document_loaders/PDF.pdf
+#
+# Answerable items
+#   pages     1-based PDF pages that hold the answer
+#   evidence  a phrase copied verbatim from the PDF's extracted text (typos
+#             and missing spaces included). Retrieval "hits" when a retrieved
+#             chunk contains it. `python -m evals.run_eval validate` checks
+#             every phrase really is on its page.
+#   expect    facts the answer must contain — each is a case-insensitive
+#             regex, `a|b` for acceptable alternatives
+#   type      definition | method | numeric | table | metadata
+#
+# Unanswerable items (answerable: false) are traps: plausible questions the
+# paper never answers, plus general-knowledge ones the model knows from
+# pre-training. The only correct response is to refuse.
+
+questions:
+  # ------------------------------------------------------------ definitions
+  - id: q01
+    type: definition
+    question: What is the name of the retrieval model proposed in the paper?
+    pages: [2]
+    evidence: Our Dense Passage Retriever (DPR)
+    expect: ['dense passage retriev|\bdpr\b']
+
+  - id: q02
+    type: definition
+    question: Which sparse retrieval methods does the paper call the de facto standard?
+    pages: [1]
+    evidence: such as TF-IDF or BM25, are the de
+    expect: ['tf-?idf', 'bm25']
+
+  - id: q03
+    type: definition
+    question: How does DPR measure the similarity between a question and a passage?
+    pages: [3]
+    evidence: using the dot product of their vectors
+    expect: ['dot product|inner product']
+
+  - id: q04
+    type: definition
+    question: How is top-k retrieval accuracy defined?
+    pages: [2]
+    evidence: which is the fraction of questions
+    expect: ['fraction|percentage|proportion', 'answer']
+
+  - id: q05
+    type: definition
+    question: In in-batch negative training, what is reused as negative examples?
+    pages: [3]
+    evidence: gold passages from the same batch as negatives
+    expect: ['same (mini-?)?batch|in the batch|in-batch', 'gold|positive|other questions']
+
+  - id: q06
+    type: definition
+    question: What networks are used as the question and passage encoders?
+    pages: [3]
+    evidence: two independent BERT
+    expect: ['bert', 'two|independent|separate']
+
+  - id: q07
+    type: definition
+    question: What does ICT stand for in ORQA's pretraining objective?
+    pages: [1]
+    evidence: inverse cloze task (ICT)
+    expect: ['inverse cloze']
+
+  - id: q08
+    type: definition
+    question: Which three types of negative passages does the paper consider?
+    pages: [3]
+    evidence: three different types of negatives
+    expect: ['random', 'bm25', 'gold']
+
+  # ---------------------------------------------------------------- method
+  - id: q09
+    type: method
+    question: Which token's representation is taken as the encoder output?
+    pages: [3]
+    evidence: take the representation at the [CLS]
+    expect: ['\bcls\b']
+
+  - id: q10
+    type: method
+    question: Which library is used to index the passage embeddings offline?
+    pages: [3]
+    evidence: them using FAISS
+    expect: ['faiss']
+
+  - id: q11
+    type: method
+    question: What loss function is optimized when training the encoders?
+    pages: [3]
+    evidence: negative log likelihood of the positive
+    expect: ['negative log[- ]?likelihood|\bnll\b']
+
+  - id: q12
+    type: method
+    question: Which Wikipedia dump is used as the source documents?
+    pages: [4]
+    evidence: Wikipedia dump from Dec. 20, 2018
+    expect: ['2018', 'dec']
+
+  - id: q13
+    type: method
+    question: How are the Wikipedia articles split into passages?
+    pages: [4]
+    evidence: blocks of 100 words as passages
+    expect: ['\b100\b', 'word']
+
+  - id: q14
+    type: method
+    question: What is prepended to each passage?
+    pages: [4]
+    evidence: prepended with the title
+    expect: ['title', '\bsep\b']
+
+  - id: q15
+    type: method
+    question: How are positive passages chosen for TREC, WebQuestions and TriviaQA?
+    pages: [4]
+    evidence: highest-ranked passage from BM25 that contains
+    expect: ['bm25', 'highest|top']
+
+  - id: q16
+    type: method
+    question: Why does the similarity function need to be decomposable?
+    pages: [3]
+    evidence: needs to be decomposable
+    expect: ['pre-?comput']
+
+  - id: q17
+    type: method
+    question: Which optimizer is used to train DPR?
+    pages: [5]
+    evidence: using Adam, linear
+    expect: ['adam']
+
+  - id: q18
+    type: method
+    question: Why does the paper think DPR performs worse on SQuAD?
+    pages: [5]
+    evidence: high lexical overlap between
+    expect: ['overlap']
+
+  - id: q19
+    type: method
+    question: How does the reader choose the final answer?
+    pages: [7]
+    evidence: from the passage with the highest passage selection
+    expect: ['span', 'selection|highest']
+
+  - id: q20
+    type: method
+    question: How do L2 distance and cosine similarity compare with the dot product?
+    pages: [6]
+    evidence: L2 performs comparable to dot product
+    expect: ['compar|similar|on par', 'cosine']
+
+  # --------------------------------------------------------------- numeric
+  - id: q21
+    type: numeric
+    question: How many passages does the final Wikipedia corpus contain?
+    pages: [4]
+    evidence: which results in 21,015,324 passages
+    expect: ['21[, ]?015[, ]?324|21 ?million']
+
+  - id: q22
+    type: numeric
+    question: What batch size is used to train the main DPR model?
+    pages: [5]
+    evidence: with a batch size of128
+    expect: ['(?<!\d)128(?!\d)']
+
+  - id: q23
+    type: numeric
+    question: What learning rate is used to train DPR?
+    pages: [5]
+    evidence: with a learning rate of 10−5 using Adam
+    expect: ['10\s*[\^×x*]?\s*-\s*5|1e-?5|0\.00001']
+
+  - id: q24
+    type: numeric
+    question: For how many epochs are the encoders trained on large and on small datasets?
+    pages: [5]
+    evidence: for up to 40
+    expect: ['\b40\b', '\b100\b']
+
+  - id: q25
+    type: numeric
+    question: What dropout rate is used when training DPR?
+    pages: [5]
+    evidence: dropout rate 0.1
+    expect: ['0\.1\b']
+
+  - id: q26
+    type: numeric
+    question: How many questions per second can DPR process compared with BM25/Lucene?
+    pages: [7]
+    evidence: 995.0 questions per second
+    expect: ['995', '23\.7']
+
+  - id: q27
+    type: numeric
+    question: How long does it take to compute the dense embeddings and to build the FAISS index for 21 million passages?
+    pages: [7]
+    evidence: taking roughly 8.8 hours on 8 GPUs
+    expect: ['8\.8', '8\.5']
+
+  - id: q28
+    type: numeric
+    question: How long does building the Lucene inverted index take?
+    pages: [7]
+    evidence: takes only about 30 minutes
+    expect: ['\b30 ?min']
+
+  - id: q29
+    type: numeric
+    question: What value of lambda is used to combine BM25 and DPR scores?
+    pages: [5]
+    evidence: = 1.1 based on the retrieval accuracy
+    expect: ['1\.1\b']
+
+  - id: q30
+    type: numeric
+    question: How many training examples does DPR need to already outperform BM25?
+    pages: [6]
+    evidence: using only 1,000 examples already outperforms BM25
+    expect: ['1[, ]?000|one thousand|\b1k\b']
+
+  - id: q31
+    type: numeric
+    question: How many passages per question are sampled to train the reader?
+    pages: [7]
+    evidence: negative passages from the top 100 passages
+    expect: ['\b24\b']
+
+  - id: q32
+    type: numeric
+    question: What batch sizes are used to train the reader on large and small datasets?
+    pages: [7]
+    evidence: batch size of 16 for large
+    expect: ['\b16\b', '\b4\b']
+
+  # ----------------------------------------------------------------- tables
+  - id: q33
+    type: table
+    question: What top-20 accuracy do DPR and BM25 reach on Natural Questions?
+    pages: [5]
+    evidence: 78.4% vs. 59.1% for top-20 accuracy
+    expect: ['78\.4', '59\.1']
+
+  - id: q34
+    type: table
+    question: What top-5 accuracy do DPR and BM25 reach on Natural Questions?
+    pages: [2]
+    evidence: 65.2% vs. 42.9% in Top-5 accuracy
+    expect: ['65\.2', '42\.9']
+
+  - id: q35
+    type: table
+    question: How does DPR's end-to-end QA accuracy on Natural Questions compare with ORQA's?
+    pages: [2]
+    evidence: (41.5% vs. 33.3%) in the open Natural Questions
+    expect: ['41\.5', '33\.3']
+
+  - id: q36
+    type: table
+    question: How many test questions does Natural Questions have?
+    pages: [4]
+    evidence: Natural Questions 79,168 58,880 8,757 3,610
+    expect: ['3[, ]?610']
+
+  - id: q37
+    type: table
+    question: On which dataset does BM25 retrieve better than DPR?
+    pages: [5]
+    evidence: With the exception of SQuAD
+    expect: ['squad']
+
+  - id: q38
+    type: table
+    question: What top-20 retrieval accuracy does the multi-dataset DPR reach on TREC?
+    pages: [5]
+    evidence: Multi DPR 79.4 78.8 75.0 89.1 51.6
+    expect: ['89\.1']
+
+  - id: q39
+    type: table
+    question: What top-5 accuracy does in-batch training with 127 gold negatives plus 128 BM25 negatives reach?
+    pages: [6]
+    evidence: 127+128
+    expect: ['65\.8']
+
+  - id: q40
+    type: table
+    question: What exact match score does jointly training the retriever and reader get on Natural Questions?
+    pages: [8]
+    evidence: obtains a score of 39.8 EM
+    expect: ['39\.8']
+
+  # --------------------------------------------------------------- metadata
+  - id: q41
+    type: metadata
+    question: At which conference was the paper published?
+    pages: [1]
+    evidence: Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing
+    expect: ['emnlp|empirical methods']
+
+  - id: q42
+    type: metadata
+    question: Which institutions are the authors affiliated with?
+    pages: [1]
+    evidence: University of Washington
+    expect: ['facebook', 'washington', 'princeton']
+
+  # ----------------------------------------------------------- unanswerable
+  - id: u01
+    answerable: false
+    type: unanswerable
+    question: What weight decay value is used when training DPR?
+
+  - id: u02
+    answerable: false
+    type: unanswerable
+    question: How much did it cost in US dollars to train DPR?
+
+  - id: u03
+    answerable: false
+    type: unanswerable
+    question: What top-20 retrieval accuracy does DPR achieve on MS MARCO?
+
+  - id: u04
+    answerable: false
+    type: unanswerable
+    question: What top-100 accuracy does DPR reach on the BEIR benchmark?
+
+  - id: u05
+    answerable: false
+    type: unanswerable
+    question: What embedding dimension does ColBERT use?
+
+  - id: u06
+    answerable: false
+    type: unanswerable
+    question: How many parameters does the reader model have?
+
+  - id: u07
+    answerable: false
+    type: unanswerable
+    question: What maximum sequence length in tokens is used for the question encoder?
+
+  - id: u08
+    answerable: false
+    type: unanswerable
+    question: What exact match score does DPR get on HotpotQA?
+
+  - id: u09
+    answerable: false
+    type: unanswerable
+    question: Which random seed was used in the experiments?
+
+  - id: u10
+    answerable: false
+    type: unanswerable
+    question: What is the boiling point of water at sea level in degrees Celsius?
+
+  - id: u11
+    answerable: false
+    type: unanswerable
+    question: What does the self-attention mechanism in a transformer compute?
+
+  - id: u12
+    answerable: false
+    type: unanswerable
+    question: What is the capital of France?

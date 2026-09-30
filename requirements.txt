@@ -51,3 +51,8 @@ streamlit
 
 tqdm
 requests
+
+# Evals & tests
+
+pyyaml
+pytest

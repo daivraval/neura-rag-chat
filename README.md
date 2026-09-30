@@ -144,13 +144,57 @@ messages(id INTEGER PK, session_id TEXT → sessions(id) ON DELETE CASCADE,
 
 | Path | What it is |
 |---|---|
-| `app.py` | The product — FastAPI backend, RAG pipeline, SQLite history, and the entire frontend in one file |
+| `app.py` | The product — FastAPI backend, SQLite history, and the entire frontend in one file |
+| `neura/pipeline.py` | The RAG pipeline (chunking, embeddings, retrieval, prompt, LLM) shared by the app, the CLI and the evals |
 | `create_database.py` | Indexer: PDF → chunks → embeddings → Chroma |
+| `evals/` | Eval suite — golden set, scoring, runner, and the latest reports in `evals/results/` |
+| `tests/` | Unit tests for the eval scoring |
 | `main.py` | Same pipeline as a CLI REPL |
 | `1_document_loaders/` | 🧪 Loader & splitter experiments — PDF, web-page summarization, splitter comparisons |
 | `Retrievers/` | 🧪 Retrieval-strategy experiments — MMR, MultiQuery, ArXiv, each with worked examples in the docstrings |
 
 The two 🧪 folders are a **learning lab**, not app dependencies. They're the notes behind the choices in the table above — kept in the repo on purpose, because the reasoning is the interesting part.
+
+---
+
+## Evaluation
+
+"Refuses to guess" is a claim until it's measured. `evals/` holds a **54-question golden set** about the indexed paper, graded against the PDF itself:
+
+- **42 answerable questions** (definitions, method details, numbers, table lookups, metadata). Each one is pinned to its page and a verbatim evidence passage.
+- **12 unanswerable traps.** Some are plausible questions the paper never answers ("what batch size?"). Others are general knowledge the model already knows ("what is the capital of France?"). The only correct response is a refusal.
+
+```bash
+python -m evals.run_eval validate      # checks every evidence passage is really on its page
+python -m evals.run_eval retrieval     # offline, compares retrieval configs, no API calls
+python -m evals.run_eval generation --judge --model <hf-repo-id>   # full pipeline, needs HF_TOKEN
+pytest                                 # unit tests for the scoring
+```
+
+**Retrieval** is scored by **evidence hit@k**: did a retrieved chunk contain the exact passage that answers the question? It also reports MRR, page-level hit rate and context precision.
+
+**Generation** is scored by:
+- **answer accuracy**: every expected fact is present in the answer
+- **refusal accuracy**: unanswerable questions are refused
+- **false-refusal rate**
+- **faithfulness**, graded by a separate LLM judge (`Llama-3.3-70B-Instruct`)
+
+Each wrong answer is labelled a *retrieval miss* (the passage never reached the model) or a *generation miss* (it did, and the model still got it wrong).
+
+### Current results: retrieval
+
+Full report: [`evals/results/retrieval.md`](evals/results/retrieval.md).
+
+| Config | Setup | Evidence hit@4 | MRR | Page hit@4 |
+|---|---|---|---|---|
+| **app (shipped)** | 1000/200 chunks, MMR λ=0.5 | 69.0% | 0.563 | 85.7% |
+| similarity | 1000/200 chunks, cosine top-4 | **83.3%** | **0.609** | **88.1%** |
+| mmr-0.8 | 1000/200 chunks, MMR λ=0.8 | 76.2% | 0.591 | 83.3% |
+| small-chunks | 500/100 chunks, top-8 | 76.2% | 0.512 | 85.7% |
+
+The eval's first finding: **on this paper, MMR costs recall.** Plain similarity finds the answering passage 14 points more often. MMR's diversity term pushes out the second-best chunk, and for pinpoint questions ("what loss function?", "which optimizer?") that chunk is often the one with the answer. Metadata questions (author, grant) miss under every config: the title-page chunk is dominated by the abstract.
+
+Can the top retrieval score detect a question the document can't answer? The **AUROC is 0.71**: it separates them better than chance, but not well enough to refuse on the score alone yet.
 
 ---
 

@@ -26,55 +26,18 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 load_dotenv()
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_history.db")
-CHROMA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
 
 # ---------------------------------------------------------------- RAG setup
 rag = {}
 
 
 def build_rag():
-    from langchain_huggingface import (
-        ChatHuggingFace,
-        HuggingFaceEmbeddings,
-        HuggingFaceEndpoint,
-    )
-    from langchain_community.vectorstores import Chroma
-    from langchain_core.prompts import ChatPromptTemplate
+    from neura import pipeline
 
-    embedding_model = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-    )
-    vector_store = Chroma(
-        persist_directory=CHROMA_DIR,
-        embedding_function=embedding_model,
-    )
-    retriever = vector_store.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": 4, "fetch_k": 10, "lambda_mult": 0.5},
-    )
-    llm = ChatHuggingFace(
-        llm=HuggingFaceEndpoint(
-            repo_id="Qwen/Qwen2.5-7B-Instruct",
-            task="text-generation",
-            max_new_tokens=400,
-            do_sample=False,
-            huggingfacehub_api_token=os.getenv("HF_TOKEN"),
-        )
-    )
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                'You are a helpful AI assistant. Use ONLY the provided context to '
-                'answer the question. If the answer is not present in the context, '
-                'say: "I could not find the answer in the document."',
-            ),
-            ("human", "Context: {context}\nQuestion: {question}"),
-        ]
-    )
-    rag["retriever"] = retriever
-    rag["llm"] = llm
-    rag["prompt"] = prompt
+    rag["retriever"] = pipeline.make_retriever(pipeline.open_index(), **pipeline.RETRIEVAL)
+    rag["llm"] = pipeline.make_llm()
+    rag["prompt"] = pipeline.make_prompt()
+    rag["generate"] = pipeline.generate
 
 
 # ------------------------------------------------------------- history store
@@ -207,10 +170,8 @@ def chat(body: ChatIn):
         )
 
     docs = rag["retriever"].invoke(query)
-    context = "\n\n".join(d.page_content for d in docs)
-    final_prompt = rag["prompt"].invoke({"context": context, "question": query})
     try:
-        answer = rag["llm"].invoke(final_prompt).content
+        answer = rag["generate"](rag["llm"], rag["prompt"], query, docs)
     except Exception as exc:
         raise HTTPException(502, f"LLM error: {exc}") from exc
 
