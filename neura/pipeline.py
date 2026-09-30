@@ -13,7 +13,27 @@ PDF_PATH = os.path.join(ROOT, "1_document_loaders", "PDF.pdf")
 CHROMA_DIR = os.path.join(ROOT, "chroma_db")
 
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-LLM_REPO = "Qwen/Qwen2.5-7B-Instruct"
+
+# Every provider speaks the OpenAI chat API, so one client covers them all.
+# Pick one with LLM_PROVIDER (default groq) and optionally LLM_MODEL in .env.
+PROVIDERS = {
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "key_env": "GROQ_API_KEY",
+        "model": "llama-3.3-70b-versatile",
+    },
+    "huggingface": {
+        "base_url": "https://router.huggingface.co/v1",
+        "key_env": "HF_TOKEN",
+        "model": "Qwen/Qwen2.5-72B-Instruct",
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1",
+        "key_env": "OPENAI_API_KEY",
+        "model": None,  # no default — set LLM_MODEL
+    },
+}
+DEFAULT_PROVIDER = "groq"
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
@@ -88,17 +108,42 @@ def make_retriever(store, search_type="mmr", k=4, fetch_k=10, lambda_mult=0.5):
 
 
 # ---------------------------------------------------------------- generation
-def make_llm(max_new_tokens=400, repo_id=LLM_REPO):
-    from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+def resolve_llm(provider=None, model=None):
+    """Settle (provider, model): explicit args, then .env, then the preset.
 
-    return ChatHuggingFace(
-        llm=HuggingFaceEndpoint(
-            repo_id=repo_id,
-            task="text-generation",
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            huggingfacehub_api_token=os.getenv("HF_TOKEN"),
-        )
+    LLM_MODEL only applies to the provider named in LLM_PROVIDER, so asking
+    for another provider explicitly never inherits a model it can't serve.
+    """
+    env_provider = os.getenv("LLM_PROVIDER") or DEFAULT_PROVIDER
+    provider = provider or env_provider
+    if provider not in PROVIDERS:
+        raise ValueError(f"unknown LLM provider {provider!r} — choose from {', '.join(PROVIDERS)}")
+    if not model and provider == env_provider:
+        model = os.getenv("LLM_MODEL")
+    model = model or PROVIDERS[provider]["model"]
+    if not model:
+        raise ValueError(f"set LLM_MODEL — provider {provider!r} has no default model")
+    return provider, model
+
+
+def make_llm(max_new_tokens=400, provider=None, model=None, **extra):
+    """Chat model on any OpenAI-compatible provider, temperature 0 so the
+    same question against the same index gives the same answer."""
+    from langchain_openai import ChatOpenAI
+
+    provider, model = resolve_llm(provider, model)
+    preset = PROVIDERS[provider]
+    api_key = os.getenv(preset["key_env"])
+    if not api_key:
+        raise RuntimeError(f"{preset['key_env']} is not set (needed for LLM provider {provider!r}) — see .env.example")
+    return ChatOpenAI(
+        model=model,
+        base_url=preset["base_url"],
+        api_key=api_key,
+        temperature=0,
+        max_tokens=max_new_tokens,
+        max_retries=3,
+        **extra,
     )
 
 

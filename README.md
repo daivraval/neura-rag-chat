@@ -12,7 +12,7 @@
 <img src="https://img.shields.io/badge/LangChain-1C3C3C?style=for-the-badge&logo=langchain&logoColor=white" />
 <img src="https://img.shields.io/badge/Chroma-FF6B4A?style=for-the-badge&logo=chromatic&logoColor=white" />
 <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" />
-<img src="https://img.shields.io/badge/Qwen_2.5_7B-6f5bf5?style=for-the-badge&logo=huggingface&logoColor=white" />
+<img src="https://img.shields.io/badge/Groq-Llama_3.3_70B-F55036?style=for-the-badge" />
 <img src="https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white" />
 
 </div>
@@ -29,7 +29,7 @@ Most "chat with your PDF" demos will happily answer from the model's own memory 
 
 > Use **ONLY** the provided context to answer the question. If the answer is not present in the context, say: *"I could not find the answer in the document."*
 
-Paired with `do_sample=False` (greedy decoding), the same question against the same index returns the same answer every time. That's the whole design goal: **a retrieval system you can actually audit**, not a plausible-sounding one.
+Paired with `temperature=0`, the same question against the same index returns the same answer every time. That's the whole design goal: **a retrieval system you can actually audit**, not a plausible-sounding one.
 
 ---
 
@@ -48,7 +48,7 @@ flowchart LR
         F[User question] --> G["MMR retrieval<br/>fetch_k=10 → k=4 · λ=0.5"]
         E -.-> G
         G --> H["Context + grounding prompt"]
-        H --> I["Qwen2.5-7B-Instruct<br/>HF Inference API · greedy"]
+        H --> I["Llama 3.3 70B (default)<br/>Groq · any OpenAI-compatible API · temp 0"]
         I --> J[Grounded answer + source snippets]
         J --> K[("SQLite<br/>chat_history.db")]
     end
@@ -69,9 +69,9 @@ Every knob that shapes an answer, in one place:
 | Search | `search_type` | `mmr` | Diversity-aware; kills near-duplicate chunks |
 | Search | `fetch_k` → `k` | `10` → `4` | Cast wide, return four distinct passages |
 | Search | `lambda_mult` | `0.5` | Balanced relevance ↔ diversity (`1.0` = pure relevance, `0.0` = pure diversity) |
-| Generation | `Qwen2.5-7B-Instruct` | HF Inference API | Strong instruction-following, respects the refusal clause |
-| Generation | `max_new_tokens` | `400` | Long enough to explain, short enough to stay on-context |
-| Generation | `do_sample` | `False` | Deterministic — reproducible answers |
+| Generation | `llama-3.3-70b-versatile` | Groq (swappable) | Strong instruction-following, fast, free tier. `LLM_PROVIDER` / `LLM_MODEL` switch to Hugging Face or OpenAI |
+| Generation | `max_tokens` | `400` | Long enough to explain, short enough to stay on-context |
+| Generation | `temperature` | `0` | Deterministic — reproducible answers |
 
 ---
 
@@ -84,11 +84,13 @@ python -m venv .venv && .venv\Scripts\activate     # Windows
 pip install -r requirements.txt
 ```
 
-Copy `.env.example` → `.env` and set your token. Only `HF_TOKEN` is required:
+Copy `.env.example` → `.env`. The default provider is [Groq](https://console.groq.com/keys), which has a free tier, so one key is enough:
 
 ```env
-HF_TOKEN="hf_..."
+GROQ_API_KEY="gsk_..."
 ```
+
+To use another provider, set `LLM_PROVIDER` to `huggingface` (uses `HF_TOKEN`) or `openai` (uses `OPENAI_API_KEY` plus `LLM_MODEL`). Any OpenAI-compatible API works: add it to `PROVIDERS` in `neura/pipeline.py`.
 
 Drop your PDF at `1_document_loaders/PDF.pdf`, build the index, and run:
 
@@ -167,7 +169,7 @@ The two 🧪 folders are a **learning lab**, not app dependencies. They're the n
 ```bash
 python -m evals.run_eval validate      # checks every evidence passage is really on its page
 python -m evals.run_eval retrieval     # offline, compares retrieval configs, no API calls
-python -m evals.run_eval generation --judge --model <hf-repo-id>   # full pipeline, needs HF_TOKEN
+python -m evals.run_eval generation --judge   # full pipeline on the configured LLM (--provider / --model to compare)
 pytest                                 # unit tests for the scoring
 ```
 
@@ -177,7 +179,7 @@ pytest                                 # unit tests for the scoring
 - **answer accuracy**: every expected fact is present in the answer
 - **refusal accuracy**: unanswerable questions are refused
 - **false-refusal rate**
-- **faithfulness**, graded by a separate LLM judge (`Llama-3.3-70B-Instruct`)
+- **faithfulness**, graded by an LLM judge from a different model family (`gpt-oss-120b` on Groq)
 
 Each wrong answer is labelled a *retrieval miss* (the passage never reached the model) or a *generation miss* (it did, and the model still got it wrong).
 
@@ -223,13 +225,13 @@ Being straight about what this does and doesn't do:
 - [ ] Page-anchored citations that jump into the PDF
 - [ ] Cross-encoder re-ranking after MMR
 - [ ] Drag-and-drop upload + in-app re-indexing
-- [ ] Swappable LLM backends (Mistral / OpenAI keys are already in `.env.example`)
+- [x] Swappable LLM backends: Groq, Hugging Face, or any OpenAI-compatible API
 
 ---
 
 <div align="center">
 
-**LangChain** · **Chroma** · **Hugging Face** · **FastAPI** · **SQLite** · **vanilla JS**
+**LangChain** · **Chroma** · **Groq** · **Hugging Face** · **FastAPI** · **SQLite** · **vanilla JS**
 
 Built by [@daivraval](https://github.com/daivraval) · ⭐ it if the grounding contract is your kind of thing
 

@@ -9,6 +9,7 @@ Run:  uvicorn app:app --reload   (or)   python app.py
 Then open http://127.0.0.1:8000
 """
 
+import html
 import os
 import sqlite3
 import uuid
@@ -38,6 +39,7 @@ def build_rag():
     rag["llm"] = pipeline.make_llm()
     rag["prompt"] = pipeline.make_prompt()
     rag["generate"] = pipeline.generate
+    rag["model"] = pipeline.resolve_llm()[1].split("/")[-1]
 
 
 # ------------------------------------------------------------- history store
@@ -193,7 +195,7 @@ def chat(body: ChatIn):
 # ----------------------------------------------------------------- frontend
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return PAGE
+    return PAGE.replace("{{MODEL}}", html.escape(rag.get("model", "")))
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -412,7 +414,7 @@ details.src .snip{margin-top:.6rem;font-family:'JetBrains Mono',monospace;font-s
     </button>
     <div class="hist-label">History</div>
     <div id="sessions"></div>
-    <div class="side-foot"><span class="dot"></span> Qwen 2.5 · MiniLM · Chroma</div>
+    <div class="side-foot"><span class="dot"></span> {{MODEL}} · MiniLM · Chroma</div>
   </aside>
 
   <main>

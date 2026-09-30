@@ -4,7 +4,7 @@ whether it answers (or refuses) correctly.
 
     python -m evals.run_eval validate                 # self-check the golden set
     python -m evals.run_eval retrieval                # offline, compares retrieval configs
-    python -m evals.run_eval generation [--judge]     # full pipeline, needs HF_TOKEN
+    python -m evals.run_eval generation [--judge]     # full pipeline, needs an LLM key (GROQ_API_KEY by default)
 
 Each run writes evals/results/<mode>.md (the report) and <mode>.json
 (every question, every retrieved page, every answer) so a regression can be
@@ -53,8 +53,12 @@ CONFIGS = {
     "small-chunks": dict(chunk_size=500, chunk_overlap=100, search_type="similarity", k=8),
 }
 
-# A larger model than the ones under test, so it isn't grading its own work.
-JUDGE_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+# Default judge per provider: a different model family from the default
+# answering model, so the judge isn't grading its own work.
+JUDGE_MODELS = {
+    "groq": "openai/gpt-oss-120b",
+    "huggingface": "meta-llama/Llama-3.3-70B-Instruct",
+}
 JUDGE_SYSTEM = (
     "You are a strict fact-checker. Decide whether every factual claim in the "
     "ANSWER is directly supported by the CONTEXT. Reply with exactly one word: "
@@ -300,32 +304,47 @@ class Fatal(Exception):
     """An API error retrying can't fix — out of credits, bad token, unknown model."""
 
 
-def call_with_retry(fn, attempts=3, wait=5):
+def call_with_retry(fn, attempts=5, wait=5):
+    """Retry transient failures (429 rate limits, timeouts, cold models) with
+    exponential backoff; give up at once on errors retrying can't fix."""
     for i in range(attempts):
         try:
             return fn()
-        except Exception as exc:  # network / rate limit / cold model
-            if re.search(r"\b40[0-4]\b|Payment Required|model_not_supported", str(exc)):
+        except Exception as exc:
+            if re.search(r"\b40[0-4]\b|Payment Required|model_not_supported|model_not_found", str(exc)):
                 raise Fatal(str(exc).splitlines()[0]) from exc
             if i == attempts - 1:
                 raise
-            print(f"    retry after error: {exc}")
-            time.sleep(wait * (i + 1))
+            delay = min(60, wait * 2**i)
+            print(f"    retry in {delay}s after error: {str(exc).splitlines()[0]}")
+            time.sleep(delay)
 
 
 def cmd_generation(args):
-    if not os.getenv("HF_TOKEN"):
-        sys.exit("HF_TOKEN is not set (see .env.example) — generation eval calls the HF Inference API.")
     from langchain_core.prompts import ChatPromptTemplate
+
+    try:
+        provider, model = pipeline.resolve_llm(args.provider, args.model)
+        llm = pipeline.make_llm(provider=provider, model=model)
+        judge = judge_prompt = judge_label = None
+        if args.judge:
+            judge_provider, judge_model = pipeline.resolve_llm(
+                args.judge_provider or provider, args.judge_model or JUDGE_MODELS.get(args.judge_provider or provider)
+            )
+            # Reasoning models spend tokens thinking before the one-word verdict.
+            reasoning = {"reasoning_effort": "low"} if "gpt-oss" in judge_model else {}
+            judge = pipeline.make_llm(
+                max_new_tokens=1024 if reasoning else 10, provider=judge_provider, model=judge_model, **reasoning
+            )
+            judge_label = f"{judge_model} on {judge_provider}"
+    except (ValueError, RuntimeError) as exc:
+        sys.exit(str(exc))
 
     questions = select(load_golden(), args)
     cfg = CONFIGS[args.config]
     retriever = make_retriever(cfg)
-    llm = pipeline.make_llm(repo_id=args.model)
     prompt = pipeline.make_prompt()
-    judge = judge_prompt = None
     if args.judge:
-        judge = pipeline.make_llm(max_new_tokens=10, repo_id=args.judge_model)
         judge_prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", JUDGE_SYSTEM),
@@ -335,6 +354,8 @@ def cmd_generation(args):
 
     rows = []
     for i, q in enumerate(questions, 1):
+        if i > 1 and args.sleep:
+            time.sleep(args.sleep)  # stay under free-tier rate limits
         docs = retriever.invoke(q["question"])
         row = {"id": q["id"], "type": q["type"], "answerable": q["answerable"], "question": q["question"]}
         t0 = time.perf_counter()
@@ -385,7 +406,9 @@ def cmd_generation(args):
     latencies = sorted(r["latency_s"] for r in done)
     s = {
         "config": f"{args.config} ({describe(cfg)})",
-        "model": args.model,
+        "model": f"{model} on {provider}",
+        "judge": judge_label,
+        "judge_failures": sum(r.get("faithful") is None for r in ans if args.judge and not r["refused"]),
         "answered": len(done),
         "errors": len(rows) - len(done),
         "answer_accuracy": M.mean([r["correct"] for r in ans]),
@@ -415,7 +438,8 @@ def cmd_generation(args):
                 ["Refusal accuracy", pct(s["refusal_accuracy"]), f"unanswerable questions ({len(una)}) correctly refused"],
                 ["Hallucination rate", pct(None if s["refusal_accuracy"] is None else 1 - s["refusal_accuracy"]), "unanswerable questions answered anyway"],
                 ["False refusal rate", pct(s["false_refusal_rate"]), "answerable questions wrongly refused"],
-                ["Faithfulness", pct(s["faithfulness"]) if args.judge else "not run (`--judge`)", f"answers the judge ({args.judge_model}) finds fully supported by the context"],
+                ["Faithfulness", pct(s["faithfulness"]) if args.judge else "not run (`--judge`)", f"answers the judge ({judge_label}) finds fully supported by the context"
+                 + (f"; {s['judge_failures']} verdicts unusable" if s["judge_failures"] else "")],
                 ["Latency p50 / p95", f"{s['latency_s_p50']} s / {s['latency_s_p95']} s", "LLM call only"],
                 ["Errors", s["errors"], "API failures after retries (excluded from metrics)"],
             ],
@@ -445,7 +469,7 @@ def cmd_generation(args):
     if not done:
         sys.exit("every question errored — no report written.")
     # One report per model, so candidates can be compared side by side.
-    name = "generation_" + re.sub(r"[^a-z0-9.]+", "-", args.model.split("/")[-1].lower())
+    name = f"generation_{provider}_" + re.sub(r"[^a-z0-9.]+", "-", model.split("/")[-1].lower())
     write_report(name, "\n".join(md) + "\n", {"generated": now(), "summary": s, "questions": rows})
     check_threshold(args, s["answer_accuracy"], "answer accuracy")
 
@@ -471,8 +495,11 @@ def main():
     gen = sub.choices["generation"]
     gen.add_argument("--config", default="app", choices=list(CONFIGS), help="retrieval config (default: app)")
     gen.add_argument("--judge", action="store_true", help="also score faithfulness with an LLM judge")
-    gen.add_argument("--model", default=pipeline.LLM_REPO, help="HF repo id of the answering model")
-    gen.add_argument("--judge-model", default=JUDGE_MODEL, help="HF repo id for the judge")
+    gen.add_argument("--provider", choices=list(pipeline.PROVIDERS), help="LLM provider (default: LLM_PROVIDER or groq)")
+    gen.add_argument("--model", help="answering model id (default: LLM_MODEL or the provider's preset)")
+    gen.add_argument("--judge-provider", choices=list(pipeline.PROVIDERS), help="judge provider (default: same as --provider)")
+    gen.add_argument("--judge-model", help=f"judge model id (default per provider: {JUDGE_MODELS})")
+    gen.add_argument("--sleep", type=float, default=0, help="seconds to pause between questions (rate limits)")
 
     args = parser.parse_args()
     {"validate": cmd_validate, "retrieval": cmd_retrieval, "generation": cmd_generation}[args.mode](args)

@@ -5,7 +5,7 @@ Pure scoring functions for the eval suite — no models, no I/O, unit-tested.
 import re
 import unicodedata
 
-# Phrasings Qwen uses when it declines. The first is the exact contract in
+# Phrasings models use when they decline. The first is the exact contract in
 # the system prompt; the rest catch paraphrases so a polite refusal isn't
 # scored as a hallucination.
 REFUSAL_PATTERNS = [
