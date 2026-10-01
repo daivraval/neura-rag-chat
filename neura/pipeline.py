@@ -12,6 +12,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PDF_PATH = os.path.join(ROOT, "1_document_loaders", "PDF.pdf")
 CHROMA_DIR = os.path.join(ROOT, "chroma_db")
 
+# What the UI says about the indexed PDF. Update it when you swap PDF_PATH.
+DOCUMENT = {
+    "title": "Dense Passage Retrieval for Open-Domain Question Answering",
+    "short": "Dense Passage Retrieval",
+    "authors": "Karpukhin, Oğuz, Min, Lewis, Wu, Edunov, Chen, Yih",
+    "byline": "Karpukhin et al.",
+    "venue": "EMNLP 2020",
+    "license": "CC BY 4.0",
+    "url": "https://aclanthology.org/2020.emnlp-main.550/",
+}
+
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Every provider speaks the OpenAI chat API, so one client covers them all.
@@ -40,8 +51,8 @@ CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
 # The retrieval settings the app ships with. Plain similarity beat MMR
-# (fetch_k=10, lambda=0.5) in the eval: 83% vs 69% evidence hit@4, 85.7% vs
-# 78.6% answer accuracy — see evals/results/.
+# (fetch_k=10, lambda=0.5) in the eval: 59.5% vs 42.9% evidence hit@4, 69.0% vs
+# 61.9% answer accuracy — see evals/results/.
 RETRIEVAL = {"search_type": "similarity", "k": 4}
 
 REFUSAL = "I could not find the answer in the document."

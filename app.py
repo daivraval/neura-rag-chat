@@ -2,14 +2,15 @@
 NEURA — an immersive RAG chat experience.
 
 FastAPI backend wrapping the existing Chroma + HuggingFace RAG pipeline,
-with SQLite-persisted chat history and a fully custom animated frontend
-(particle field canvas, aurora gradients, glassmorphism).
+with SQLite-persisted chat history and a hand-written frontend laid out
+like a listening-library dashboard: the paper is the library, questions
+are titles on its shelf, and the composer is the player bar.
 
 Run:  uvicorn app:app --reload   (or)   python app.py
 Then open http://127.0.0.1:8000
 """
 
-import html
+import json
 import os
 import sqlite3
 import uuid
@@ -19,7 +20,7 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -35,11 +36,67 @@ rag = {}
 def build_rag():
     from neura import pipeline
 
-    rag["retriever"] = pipeline.make_retriever(pipeline.open_index(), **pipeline.RETRIEVAL)
+    store = pipeline.open_index()
+    rag["retriever"] = pipeline.make_retriever(store, **pipeline.RETRIEVAL)
     rag["llm"] = pipeline.make_llm()
     rag["prompt"] = pipeline.make_prompt()
     rag["generate"] = pipeline.generate
     rag["model"] = pipeline.resolve_llm()[1].split("/")[-1]
+    rag["info"] = {
+        "document": pipeline.DOCUMENT,
+        "chunks": store._collection.count(),
+        "chunk_size": pipeline.CHUNK_SIZE,
+        "chunk_overlap": pipeline.CHUNK_OVERLAP,
+        "retrieval": pipeline.RETRIEVAL,
+        "embeddings": pipeline.EMBED_MODEL.split("/")[-1],
+        "model": rag["model"],
+        "provider": pipeline.resolve_llm()[0],
+    }
+
+
+# ------------------------------------------------------------- eval results
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evals", "results")
+
+
+def load_evals():
+    """Headline numbers from the saved eval reports, so the UI never quotes
+    a figure the repo can't back up. Missing reports just leave gaps."""
+    import glob
+
+    out = {"retrieval": None, "answers": None}
+    path = os.path.join(RESULTS_DIR, "retrieval.json")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            r = json.load(f)
+        n = sum(q.get("answerable", True) for q in next(iter(r["questions"].values()), []))
+        out["retrieval"] = {
+            "generated": r["generated"],
+            "configs": [
+                {"name": name, "config": s["config"], "hit": s["hit_at_k"], "mrr": s["mrr"],
+                 "page_hit": s["page_hit_at_k"]}
+                for name, s in r["summary"].items()
+            ],
+            "answerable": n,
+        }
+    runs = sorted(glob.glob(os.path.join(RESULTS_DIR, "generation_app_*.json")), key=os.path.getmtime)
+    if runs:
+        with open(runs[-1], encoding="utf-8") as f:
+            g = json.load(f)
+        s = g["summary"]
+        questions = g["questions"]
+        out["answers"] = {
+            "generated": g["generated"],
+            "model": s["model"],
+            "judge": s.get("judge"),
+            "questions": len(questions),
+            "traps": sum(1 for q in questions if not q.get("answerable", True)),
+            "answer_accuracy": s["answer_accuracy"],
+            "refusal_accuracy": s["refusal_accuracy"],
+            "hallucination_rate": None if s["refusal_accuracy"] is None else 1 - s["refusal_accuracy"],
+            "false_refusal_rate": s["false_refusal_rate"],
+            "faithfulness": s.get("faithfulness"),
+        }
+    return out
 
 
 # ------------------------------------------------------------- history store
@@ -94,12 +151,24 @@ class SessionIn(BaseModel):
     title: str | None = None
 
 
+@app.get("/api/info")
+def info():
+    return rag["info"]
+
+
+@app.get("/api/evals")
+def evals():
+    return load_evals()
+
+
 @app.get("/api/sessions")
 def list_sessions():
     with db() as conn:
         rows = conn.execute(
             "SELECT s.id, s.title, s.created_at,"
-            " (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS n"
+            " (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS n,"
+            " (SELECT substr(content, 1, 200) FROM messages m WHERE m.session_id = s.id"
+            "  AND m.role = 'ai' ORDER BY m.id DESC LIMIT 1) AS preview"
             " FROM sessions s ORDER BY s.created_at DESC"
         ).fetchall()
     return [dict(r) for r in rows]
@@ -127,7 +196,26 @@ def get_session(sid: str):
             " WHERE session_id = ? ORDER BY id",
             (sid,),
         ).fetchall()
-    return {"id": sid, "title": session["title"], "messages": [dict(m) for m in msgs]}
+    messages = []
+    for m in msgs:
+        m = dict(m)
+        m["sources"] = parse_sources(m["sources"])
+        messages.append(m)
+    return {"id": sid, "title": session["title"], "messages": messages}
+
+
+def parse_sources(raw):
+    """Sources are stored as JSON [{text, page}]; older rows used ' ||| '."""
+    if not raw:
+        return []
+    if raw.startswith("["):
+        return json.loads(raw)
+    return [{"text": t, "page": None} for t in raw.split(" ||| ")]
+
+
+def snippet(doc):
+    page = doc.metadata.get("page")
+    return {"text": doc.page_content[:220], "page": None if page is None else page + 1}
 
 
 @app.delete("/api/sessions/{sid}")
@@ -175,27 +263,39 @@ def chat(body: ChatIn):
     try:
         answer = rag["generate"](rag["llm"], rag["prompt"], query, docs)
     except Exception as exc:
+        if "429" in str(exc) or "rate_limit" in str(exc):
+            raise HTTPException(
+                429, "the LLM provider's rate limit was reached. Wait a few seconds"
+            ) from exc
         raise HTTPException(502, f"LLM error: {exc}") from exc
 
-    source_snips = " ||| ".join(d.page_content[:220] for d in docs[:3])
+    sources = [snippet(d) for d in docs[:3]]
     with db() as conn:
         conn.execute(
             "INSERT INTO messages (session_id, role, content, sources, created_at)"
             " VALUES (?, 'ai', ?, ?, ?)",
-            (sid, answer, source_snips, now()),
+            (sid, answer, json.dumps(sources), now()),
         )
 
     return {
         "session_id": sid,
         "answer": answer,
-        "sources": [d.page_content[:220] for d in docs[:3]],
+        "sources": sources,
     }
+
+
+@app.get("/pdf")
+def pdf():
+    """The indexed document, so page links in the UI open the source."""
+    from neura import pipeline
+
+    return FileResponse(pipeline.PDF_PATH, media_type="application/pdf")
 
 
 # ----------------------------------------------------------------- frontend
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return PAGE.replace("{{MODEL}}", html.escape(rag.get("model", "")))
+    return PAGE
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -205,433 +305,797 @@ PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>NEURA — Document Intelligence</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;700;800&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&family=Hanken+Grotesk:wght@400;500;600;800&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#05060f; --bg2:#0a0d1f;
-  --ink:#eef0ff; --ink-dim:#8b90b5; --ink-faint:#4c5170;
-  --acc:#7c5cff; --acc2:#00e5c7; --acc3:#ff4d8d;
-  --glass:rgba(18,21,44,.55); --glass-brd:rgba(140,150,255,.14);
-  --r:18px;
+  --ground:#16130E; --oxblood:#5B1408; --rust:#9F2E10; --umber:#4B3F29;
+  --amber:#E8892F; --apricot:#F1B978;
+  --raise:color-mix(in srgb,var(--umber) 16%,var(--ground));
+  --text:var(--apricot);
+  --muted:color-mix(in srgb,var(--apricot) 68%,var(--ground));
+  --line:var(--umber);
+  --line-strong:color-mix(in srgb,var(--apricot) 42%,var(--ground));
+  --on-amber:var(--ground);
+  --sans:'Hanken Grotesk',system-ui,sans-serif;
+  --mono:'Courier Prime',ui-monospace,Consolas,monospace;
+  --rail:84px; --bar:84px;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
-body{
-  background:var(--bg); color:var(--ink);
-  font-family:'Inter',sans-serif; overflow:hidden;
-  -webkit-font-smoothing:antialiased;
-}
+body{background:var(--ground);color:var(--text);font-family:var(--mono);font-size:14px;line-height:1.5;
+  -webkit-font-smoothing:antialiased;overflow:hidden}
+button,input,textarea{font:inherit;color:inherit}
+button{background:none;border:0;cursor:pointer}
+a{color:inherit;text-underline-offset:3px;text-decoration-thickness:1px}
+a:hover{color:var(--amber)}
+::selection{background:var(--rust);color:var(--apricot)}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+.icon{width:22px;height:22px;flex:none;fill:none;stroke:currentColor;stroke-width:1.6;
+  stroke-linecap:round;stroke-linejoin:round}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+*{scrollbar-color:var(--umber) transparent;scrollbar-width:thin}
 
-/* ---------- background layers ---------- */
-#stars{position:fixed;inset:0;z-index:0}
-.aurora{position:fixed;border-radius:50%;filter:blur(110px);opacity:.5;z-index:0;pointer-events:none;
-  animation:drift 26s ease-in-out infinite alternate}
-.a1{width:60vw;height:60vw;background:radial-gradient(circle,#3b1f8f 0%,transparent 65%);top:-22vw;left:-14vw}
-.a2{width:52vw;height:52vw;background:radial-gradient(circle,#003f4d 0%,transparent 65%);bottom:-20vw;right:-10vw;animation-delay:-9s}
-.a3{width:34vw;height:34vw;background:radial-gradient(circle,#5d1040 0%,transparent 65%);top:32%;left:56%;animation-delay:-17s}
-@keyframes drift{
-  0%{transform:translate(0,0) scale(1)}
-  50%{transform:translate(5vw,-4vh) scale(1.12)}
-  100%{transform:translate(-4vw,4vh) scale(.95)}
-}
-.grain{position:fixed;inset:0;z-index:1;pointer-events:none;opacity:.05;
-  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")}
+/* ---------- frame ---------- */
+#app{display:grid;grid-template-columns:var(--rail) minmax(0,1fr);grid-template-rows:var(--bar) minmax(0,1fr);
+  height:calc(100dvh - 32px);margin:16px;border:1px solid var(--line);background:var(--ground)}
 
-/* ---------- intro overlay ---------- */
-#intro{position:fixed;inset:0;z-index:50;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;background:var(--bg);
-  transition:opacity 1s ease,visibility 1s}
-#intro.gone{opacity:0;visibility:hidden}
-#intro .logo{font-family:'Syne',sans-serif;font-weight:800;font-size:clamp(3rem,9vw,7rem);
-  letter-spacing:.35em;padding-left:.35em;
-  background:linear-gradient(100deg,var(--acc),var(--acc2) 55%,var(--acc3));
-  -webkit-background-clip:text;background-clip:text;color:transparent;
-  animation:pulse 2.4s ease-in-out infinite}
-#intro .sub{margin-top:1rem;color:var(--ink-dim);letter-spacing:.5em;padding-left:.5em;
-  font-size:.7rem;text-transform:uppercase;animation:fadeUp 1.4s ease .4s both}
-#intro .bar{margin-top:2.6rem;width:180px;height:2px;background:rgba(255,255,255,.08);
-  border-radius:2px;overflow:hidden}
-#intro .bar i{display:block;height:100%;width:40%;border-radius:2px;
-  background:linear-gradient(90deg,var(--acc),var(--acc2));
-  animation:load 1.4s ease-in-out infinite}
-@keyframes load{0%{transform:translateX(-100%)}100%{transform:translateX(450%)}}
-@keyframes pulse{0%,100%{filter:brightness(1)}50%{filter:brightness(1.35)}}
-@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+/* ---------- rail ---------- */
+.rail{grid-row:1 / span 2;display:flex;flex-direction:column;border-right:1px solid var(--line)}
+.mark{height:var(--bar);display:grid;place-items:center;border-bottom:1px solid var(--line)}
+.mark svg{width:44px;height:44px}
+.rail nav{display:flex;flex-direction:column;gap:6px;padding-top:22px}
+.rail .spacer{flex:1}
+.rail .bottom{padding-bottom:16px}
+.rail-btn{display:flex;flex-direction:column;align-items:center;gap:5px;padding:10px 0;width:100%;
+  font-size:11px;color:var(--muted);text-decoration:none}
+.rail-btn:hover{color:var(--apricot)}
+.rail-btn[aria-current="page"]{color:var(--amber)}
 
-/* ---------- layout ---------- */
-#shell{position:relative;z-index:2;display:grid;grid-template-columns:290px 1fr;
-  height:100vh;gap:0}
-
-/* ---------- sidebar ---------- */
-aside{display:flex;flex-direction:column;border-right:1px solid var(--glass-brd);
-  background:linear-gradient(180deg,rgba(10,12,28,.72),rgba(8,9,22,.85));
-  backdrop-filter:blur(22px)}
-.brand{display:flex;align-items:center;gap:.7rem;padding:1.35rem 1.3rem 1.1rem}
-.orb{width:34px;height:34px;border-radius:50%;position:relative;flex:none;
-  background:conic-gradient(from 0deg,var(--acc),var(--acc2),var(--acc3),var(--acc));
-  animation:spin 7s linear infinite}
-.orb::after{content:"";position:absolute;inset:3px;border-radius:50%;background:var(--bg2)}
-@keyframes spin{to{transform:rotate(360deg)}}
-.brand b{font-family:'Syne',sans-serif;font-weight:800;font-size:1.15rem;letter-spacing:.28em}
-.brand span{font-size:.6rem;color:var(--ink-faint);letter-spacing:.24em;display:block;margin-top:2px}
-#newChat{margin:0 1.1rem .9rem;padding:.72rem 1rem;border-radius:12px;border:1px solid var(--glass-brd);
-  background:linear-gradient(120deg,rgba(124,92,255,.2),rgba(0,229,199,.12));
-  color:var(--ink);font-family:'Inter',sans-serif;font-weight:600;font-size:.83rem;
-  cursor:pointer;display:flex;align-items:center;gap:.55rem;
-  transition:transform .18s ease,box-shadow .25s ease}
-#newChat:hover{transform:translateY(-2px);box-shadow:0 8px 28px -8px rgba(124,92,255,.55)}
-#newChat svg{width:15px;height:15px}
-.hist-label{padding:.4rem 1.35rem .5rem;font-size:.62rem;letter-spacing:.26em;
-  color:var(--ink-faint);text-transform:uppercase}
-#sessions{flex:1;overflow-y:auto;padding:0 .8rem 1rem;display:flex;flex-direction:column;gap:4px}
-#sessions::-webkit-scrollbar{width:4px}
-#sessions::-webkit-scrollbar-thumb{background:rgba(140,150,255,.18);border-radius:4px}
-.sess{position:relative;padding:.66rem .8rem;border-radius:11px;cursor:pointer;
-  border:1px solid transparent;transition:all .2s ease;animation:fadeUp .4s ease both}
-.sess:hover{background:rgba(124,92,255,.08);border-color:var(--glass-brd)}
-.sess.active{background:rgba(124,92,255,.14);border-color:rgba(124,92,255,.35)}
-.sess .t{font-size:.82rem;font-weight:500;white-space:nowrap;overflow:hidden;
-  text-overflow:ellipsis;padding-right:1.4rem}
-.sess .m{font-size:.65rem;color:var(--ink-faint);margin-top:2px}
-.sess .del{position:absolute;right:.5rem;top:50%;transform:translateY(-50%);
-  width:22px;height:22px;border:none;border-radius:6px;background:transparent;
-  color:var(--ink-faint);cursor:pointer;opacity:0;transition:all .18s;display:grid;place-items:center}
-.sess:hover .del{opacity:1}
-.sess .del:hover{color:var(--acc3);background:rgba(255,77,141,.12)}
-.side-foot{padding:.9rem 1.3rem;border-top:1px solid var(--glass-brd);
-  font-size:.62rem;color:var(--ink-faint);letter-spacing:.12em;display:flex;gap:.5rem;align-items:center}
-.dot{width:7px;height:7px;border-radius:50%;background:var(--acc2);
-  box-shadow:0 0 10px var(--acc2);animation:blink 2.2s ease infinite}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
+/* ---------- top bar ---------- */
+.topbar{display:flex;align-items:stretch;background:var(--amber);color:var(--on-amber);
+  border-bottom:1px solid var(--line)}
+.topbar :focus-visible{outline-color:var(--ground)}
+.search{display:flex;align-items:center;gap:10px;margin:18px 24px;width:min(380px,40%);
+  border:1.5px solid var(--ground);padding:0 14px;height:48px}
+.search input{flex:1;min-width:0;background:none;border:0;outline:0;font-size:15px;color:var(--ground)}
+.search input::placeholder{color:color-mix(in srgb,var(--ground) 80%,var(--amber))}
+.topbar .grow{flex:1}
+.cell{border-left:1px solid var(--ground);display:flex;align-items:center}
+.doc-thumb{width:var(--bar);justify-content:center}
+.doc-thumb svg{width:52px;height:64px;border:1px solid var(--ground)}
+.doc-name{gap:14px;padding:0 20px 0 18px;min-width:0;text-align:left;cursor:pointer;width:300px}
+.doc-name span{display:block;min-width:0}
+.doc-name b{display:block;font-family:var(--sans);font-weight:600;font-size:16px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.doc-name small{font-size:12px;white-space:nowrap}
+.doc-name .narrow{display:none}
+.proof{padding:0 22px;font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.proof:hover{background:color-mix(in srgb,var(--amber) 82%,var(--ground))}
+.proof[hidden]{display:none}
+.doc-name .icon{margin-left:auto;width:18px;height:18px}
+.bell{width:var(--bar);justify-content:center}
+.bell:hover,.doc-name:hover{background:color-mix(in srgb,var(--amber) 82%,var(--ground))}
 
 /* ---------- main ---------- */
-main{display:flex;flex-direction:column;height:100vh;position:relative}
-header{padding:1.15rem 2.2rem;display:flex;justify-content:space-between;align-items:center;
-  border-bottom:1px solid var(--glass-brd);background:rgba(8,10,24,.35);backdrop-filter:blur(14px)}
-header .title{font-family:'Syne',sans-serif;font-weight:700;font-size:.95rem;letter-spacing:.06em;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:52vw}
-header .tag{font-size:.62rem;letter-spacing:.22em;color:var(--ink-faint);text-transform:uppercase;
-  border:1px solid var(--glass-brd);padding:.32rem .7rem;border-radius:99px}
+main{display:grid;grid-template-rows:auto auto minmax(0,1fr) auto;min-height:0}
+.toolbar{grid-row:1}.types{grid-row:2}.scroll{grid-row:3}.player{grid-row:4}
+.toolbar{display:flex;align-items:center;gap:12px;padding:26px 32px 22px;flex-wrap:wrap}
+.tabs{display:flex;gap:10px;flex-wrap:wrap}
+.tab{border:1px solid var(--line-strong);padding:6px 14px;font-family:var(--sans);font-size:14px;font-weight:500}
+.tab:hover{border-color:var(--apricot)}
+.tab[aria-selected="true"]{background:var(--rust);border-color:var(--rust);color:var(--apricot)}
+.tab[hidden]{display:none}
+.toolbar .grow{flex:1}
+.filter{display:flex;align-items:center;gap:10px;border:1px solid var(--line-strong);height:46px;padding:0 14px;
+  width:min(300px,100%)}
+.filter input{flex:1;min-width:0;background:none;border:0;outline:0;font-size:15px}
+.filter input::placeholder{color:var(--muted)}
+.filter:focus-within,.search:focus-within{outline:2px solid var(--amber);outline-offset:2px}
+.search:focus-within{outline-color:var(--ground)}
+.filter-btn{width:46px;height:46px;border:1px solid var(--line-strong);display:grid;place-items:center}
+.filter-btn[aria-expanded="true"]{background:var(--rust);border-color:var(--rust)}
+.types{display:flex;gap:8px;flex-wrap:wrap;padding:0 32px 18px;margin-top:-6px}
+.types[hidden]{display:none}
+.type-chip{border:1px dashed var(--line-strong);padding:4px 10px;font-size:12px;color:var(--muted)}
+.type-chip[aria-pressed="true"]{border-style:solid;border-color:var(--amber);color:var(--amber)}
 
-#feed{flex:1;overflow-y:auto;padding:2.2rem 2.2rem 1rem;scroll-behavior:smooth}
-#feed::-webkit-scrollbar{width:5px}
-#feed::-webkit-scrollbar-thumb{background:rgba(140,150,255,.18);border-radius:4px}
-.feed-inner{max-width:820px;margin:0 auto;display:flex;flex-direction:column;gap:1.4rem}
+.scroll{min-height:0;overflow-y:auto;padding:0 32px 28px}
+.view[hidden]{display:none}
 
-/* hero (empty state) */
-#hero{max-width:820px;margin:0 auto;padding-top:9vh;text-align:left;
-  animation:fadeUp .8s cubic-bezier(.2,.7,.2,1) both}
-#hero h1{font-family:'Syne',sans-serif;font-weight:800;line-height:1.04;
-  font-size:clamp(2.4rem,5.2vw,4.3rem);letter-spacing:-.01em}
-#hero h1 .grad{background:linear-gradient(95deg,var(--acc) 0%,var(--acc2) 55%,var(--acc3) 110%);
-  -webkit-background-clip:text;background-clip:text;color:transparent;
-  background-size:220% 100%;animation:sheen 6s linear infinite}
-@keyframes sheen{to{background-position:220% 0}}
-#hero p{margin-top:1.1rem;color:var(--ink-dim);font-weight:300;max-width:34rem;line-height:1.7;font-size:.98rem}
-.chips{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:2rem}
-.chip{padding:.6rem 1.05rem;border-radius:99px;border:1px solid var(--glass-brd);
-  background:var(--glass);backdrop-filter:blur(8px);font-size:.8rem;color:var(--ink-dim);
-  cursor:pointer;transition:all .22s ease}
-.chip:hover{color:var(--ink);border-color:rgba(124,92,255,.5);transform:translateY(-2px);
-  box-shadow:0 10px 30px -12px rgba(124,92,255,.5)}
+/* ---------- shelf cards ---------- */
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:30px 34px}
+.card{display:flex;flex-direction:column;border-bottom:1px solid var(--line-strong);padding-bottom:12px}
+.card[hidden]{display:none}
+.card-top{display:grid;grid-template-columns:84px minmax(0,1fr);gap:14px;margin-bottom:22px;flex:1}
+.cover-col svg{display:block;width:84px;height:112px}
+.cover-col .meta{display:block;margin-top:12px;font-size:12px;line-height:1.35;color:var(--muted)}
+.card h3{font-family:var(--sans);font-weight:500;font-size:17px;line-height:1.3;color:var(--apricot);
+  text-wrap:balance}
+.by{font-size:12px;color:var(--muted);margin:6px 0 10px}
+.blurb{font-size:12.5px;line-height:1.55;color:var(--muted);display:-webkit-box;-webkit-line-clamp:6;
+  -webkit-box-orient:vertical;overflow:hidden}
+.primary{background:var(--oxblood);color:var(--apricot);height:50px;width:100%;font-size:15px;
+  border:1px solid var(--oxblood)}
+.primary:hover{background:var(--rust);border-color:var(--rust)}
+.primary:active{transform:translateY(1px)}
+.actions{display:grid;grid-template-columns:1fr 1fr;margin-top:6px}
+.actions.one{grid-template-columns:1fr}
+.act{display:flex;align-items:center;justify-content:center;gap:8px;padding:9px 0;font-size:12.5px;color:var(--muted)}
+.act .icon{width:18px;height:18px}
+.act:hover{color:var(--apricot)}
+.act.danger:hover{color:var(--rust)}
+.empty{grid-column:1 / -1;border:1px dashed var(--line-strong);padding:36px;color:var(--muted);max-width:640px}
+.empty b{display:block;font-family:var(--sans);font-weight:500;font-size:18px;color:var(--apricot);margin-bottom:6px}
 
-/* messages */
-.msg{display:flex;gap:.95rem;animation:msgIn .5s cubic-bezier(.2,.8,.25,1) both}
-@keyframes msgIn{from{opacity:0;transform:translateY(18px) scale(.985)}to{opacity:1;transform:none}}
-.avatar{width:36px;height:36px;border-radius:12px;flex:none;display:grid;place-items:center;
-  font-family:'Syne',sans-serif;font-weight:700;font-size:.72rem}
-.msg.user .avatar{background:linear-gradient(135deg,#2b2f55,#1a1d38);border:1px solid var(--glass-brd)}
-.msg.ai .avatar{background:conic-gradient(from 40deg,var(--acc),var(--acc2),var(--acc));color:#04060f}
-.bubble{padding:1rem 1.25rem;border-radius:var(--r);line-height:1.72;font-size:.93rem;
-  max-width:86%;position:relative}
-.msg.user .bubble{background:linear-gradient(120deg,rgba(124,92,255,.16),rgba(124,92,255,.06));
-  border:1px solid rgba(124,92,255,.25)}
-.msg.ai .bubble{background:var(--glass);border:1px solid var(--glass-brd);backdrop-filter:blur(14px)}
-.caret{display:inline-block;width:8px;height:1.05em;vertical-align:-3px;margin-left:2px;
-  background:var(--acc2);animation:blink 1s steps(1) infinite}
-details.src{margin-top:.9rem;border-top:1px dashed rgba(140,150,255,.18);padding-top:.7rem}
-details.src summary{cursor:pointer;font-size:.68rem;letter-spacing:.18em;text-transform:uppercase;
-  color:var(--ink-faint);list-style:none;display:flex;align-items:center;gap:.45rem}
-details.src summary::before{content:"▸";transition:transform .2s}
-details.src[open] summary::before{transform:rotate(90deg)}
-details.src .snip{margin-top:.6rem;font-family:'JetBrains Mono',monospace;font-size:.7rem;
-  color:var(--ink-dim);background:rgba(0,0,0,.28);border-left:2px solid var(--acc2);
-  padding:.6rem .8rem;border-radius:0 8px 8px 0;line-height:1.6}
-.thinking{display:flex;gap:6px;padding:.35rem 0}
-.thinking i{width:7px;height:7px;border-radius:50%;background:var(--acc2);
-  animation:bob 1.2s ease-in-out infinite}
-.thinking i:nth-child(2){animation-delay:.15s;background:var(--acc)}
-.thinking i:nth-child(3){animation-delay:.3s;background:var(--acc3)}
-@keyframes bob{0%,100%{transform:translateY(0);opacity:.4}50%{transform:translateY(-7px);opacity:1}}
+/* ---------- thread ---------- */
+.thread{max-width:860px;display:flex;flex-direction:column;gap:26px}
+.thread h2{font-family:var(--sans);font-weight:600;font-size:24px;line-height:1.25;text-wrap:balance}
+.turn{display:grid;grid-template-columns:52px minmax(0,1fr);gap:14px;align-items:start}
+.turn svg{width:52px;height:68px;display:block}
+.turn h3{font-family:var(--sans);font-weight:500;font-size:18px;line-height:1.35}
+.answer{border:1px solid var(--line-strong);background:var(--raise);margin-left:66px}
+.answer header{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px 18px;
+  border-bottom:1px solid var(--line);font-size:12px;color:var(--muted)}
+.state{font-size:11.5px;padding:3px 10px;border:1px solid var(--line-strong);color:var(--muted)}
+.answer.refused{border-color:var(--rust)}
+.answer.refused .state{background:var(--rust);border-color:var(--rust);color:var(--apricot)}
+.answer.failed .state{background:var(--amber);border-color:var(--amber);color:var(--ground)}
+.answer-text{padding:16px 18px 18px;font-size:14.5px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere;max-width:75ch}
+.answer.refused .answer-text{color:var(--apricot)}
+.caret{display:inline-block;width:8px;height:1.1em;vertical-align:-3px;background:var(--amber);
+  animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.wait{color:var(--muted)}
+.passages{border-top:1px solid var(--line)}
+.passages summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;padding:11px 18px;
+  font-size:12.5px;color:var(--muted)}
+.passages summary::-webkit-details-marker{display:none}
+.passages summary .icon{width:16px;height:16px;transition:transform .2s}
+.passages[open] summary .icon{transform:rotate(180deg)}
+.passages summary:hover{color:var(--apricot)}
+.passages ol{list-style:none;counter-reset:p;padding:0 18px 16px;display:flex;flex-direction:column;gap:8px}
+.passages li{counter-increment:p;display:grid;grid-template-columns:30px 76px minmax(0,1fr);gap:10px;
+  border:1px solid var(--line);background:var(--ground);padding:10px 12px;font-size:12.5px;line-height:1.55;color:var(--muted)}
+.passages li::before{content:counter(p);color:var(--amber);font-weight:700}
+.passages .pg{white-space:nowrap}
 
-/* composer */
-#composer{padding:1.1rem 2.2rem 1.6rem}
-.comp-inner{max-width:820px;margin:0 auto;position:relative;border-radius:20px;padding:1.5px;
-  background:linear-gradient(120deg,rgba(124,92,255,.55),rgba(0,229,199,.4) 50%,rgba(255,77,141,.45));
-  background-size:250% 100%;animation:sheen 8s linear infinite}
-.comp-box{display:flex;align-items:flex-end;gap:.7rem;background:rgba(8,10,24,.92);
-  border-radius:19px;padding:.75rem .8rem .75rem 1.25rem;backdrop-filter:blur(20px)}
-#input{flex:1;background:transparent;border:none;outline:none;resize:none;color:var(--ink);
-  font-family:'Inter',sans-serif;font-size:.95rem;line-height:1.55;max-height:140px;padding:.35rem 0}
-#input::placeholder{color:var(--ink-faint)}
-#send{width:42px;height:42px;flex:none;border:none;border-radius:13px;cursor:pointer;
-  display:grid;place-items:center;color:#04060f;
-  background:linear-gradient(135deg,var(--acc2),var(--acc));
-  transition:transform .16s ease,box-shadow .25s ease,opacity .2s}
-#send:hover{transform:scale(1.07);box-shadow:0 6px 26px -6px rgba(0,229,199,.6)}
-#send:disabled{opacity:.35;cursor:not-allowed;transform:none;box-shadow:none}
-.hint{max-width:820px;margin:.6rem auto 0;text-align:center;font-size:.64rem;
-  color:var(--ink-faint);letter-spacing:.14em}
+/* ---------- ledger (evals / document) ---------- */
+.ledger-wrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:34px;align-items:start}
+.panel{border:1px solid var(--line-strong);background:var(--raise)}
+.panel h2{font-family:var(--sans);font-weight:600;font-size:18px;padding:16px 20px;border-bottom:1px solid var(--line)}
+.panel .sub{font-size:12px;color:var(--muted);padding:12px 20px;border-top:1px solid var(--line)}
+.rows{display:flex;flex-direction:column}
+.row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 16px;padding:14px 20px;border-top:1px solid var(--line)}
+.row:first-child{border-top:0}
+.row b{grid-column:1;font-family:var(--sans);font-weight:500;font-size:15px}
+.row span{grid-column:1;font-size:12px;color:var(--muted)}
+.row .v{grid-column:2;grid-row:1 / span 2;align-self:center;font-style:normal;font-size:24px;font-weight:700;
+  color:var(--amber);font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:11px 14px;border-top:1px solid var(--line);font-size:12.5px;vertical-align:top}
+th{font-weight:400;color:var(--muted);border-top:0}
+td.n,th.n{text-align:right}
+tr.ship td{color:var(--apricot);background:color-mix(in srgb,var(--amber) 9%,var(--raise))}
+tr.ship td:first-child{color:var(--amber)}
+td small{display:block;color:var(--muted)}
+.doc-view{display:grid;grid-template-columns:220px minmax(0,1fr);gap:34px;align-items:start;max-width:980px}
+.doc-view > svg{width:220px;height:293px;display:block}
+.doc-view h2{font-family:var(--sans);font-weight:600;font-size:26px;line-height:1.2;text-wrap:balance;margin-bottom:6px}
+dl{display:grid;grid-template-columns:150px minmax(0,1fr);border-top:1px solid var(--line);margin-top:18px}
+dt,dd{padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}
+dt{color:var(--muted)}
+.doc-actions{display:flex;gap:14px;margin-top:22px;flex-wrap:wrap}
+.doc-actions .primary{width:auto;padding:0 26px;display:inline-flex;align-items:center;gap:10px;text-decoration:none}
+.doc-actions .primary:hover{color:var(--apricot)}
 
-@media (max-width:840px){
-  #shell{grid-template-columns:1fr}
-  aside{display:none}
-  #feed,#composer{padding-left:1.1rem;padding-right:1.1rem}
+/* ---------- player bar composer ---------- */
+.player{margin:0 32px 22px;background:var(--oxblood);border:1px solid var(--rust);
+  display:grid;grid-template-columns:auto minmax(180px,300px) minmax(0,1fr) auto;align-items:center;gap:18px;
+  padding:10px 16px 10px 10px}
+.player :focus-visible{outline-color:var(--apricot)}
+.player .thumb svg{width:44px;height:58px;display:block;border:1px solid var(--rust)}
+.now b{display:block;font-family:var(--mono);font-weight:700;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.now small{display:block;font-size:11.5px;color:color-mix(in srgb,var(--apricot) 75%,var(--oxblood));white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.deck{display:flex;flex-direction:column;gap:8px;min-width:0}
+.deck-row{display:flex;align-items:center;gap:12px}
+.deck textarea{flex:1;min-width:0;resize:none;background:color-mix(in srgb,var(--ground) 55%,var(--oxblood));
+  border:1px solid color-mix(in srgb,var(--apricot) 35%,var(--oxblood));padding:10px 14px;color:var(--apricot);
+  font-size:14.5px;line-height:1.45;max-height:120px;outline:0;caret-color:var(--amber)}
+.deck textarea::placeholder{color:color-mix(in srgb,var(--apricot) 62%,var(--oxblood))}
+.deck textarea:focus{border-color:var(--apricot)}
+.send{width:46px;height:46px;border-radius:50%;background:var(--apricot);color:var(--oxblood);display:grid;place-items:center;flex:none}
+.send .icon{stroke-width:2.2}
+.send:hover{background:var(--amber)}
+.send:disabled{opacity:.45;cursor:not-allowed}
+.track{position:relative;height:3px;background:color-mix(in srgb,var(--apricot) 26%,var(--oxblood));margin:0 58px 0 2px;overflow:visible}
+.track i{position:absolute;inset:0;background:var(--apricot);transform-origin:left;
+  transform:scaleX(var(--p,0));transition:transform .12s linear}
+.track b{position:absolute;inset:0;transform:translateX(calc(var(--p,0) * 100%));transition:transform .12s linear}
+.track b::after{content:"";position:absolute;left:-5px;top:-4px;width:11px;height:11px;border-radius:50%;background:var(--apricot)}
+.track.busy i{transition:none;animation:scan 1.3s cubic-bezier(.65,0,.35,1) infinite alternate}
+.track.busy b{display:none}
+@keyframes scan{from{transform:translateX(0) scaleX(.28)}to{transform:translateX(72%) scaleX(.28)}}
+.chips{display:flex;align-items:center;gap:14px}
+.readout{font-size:12px;color:color-mix(in srgb,var(--apricot) 75%,var(--oxblood));white-space:nowrap;font-variant-numeric:tabular-nums}
+.player .new{width:42px;height:42px;display:grid;place-items:center;border:1px solid color-mix(in srgb,var(--apricot) 35%,var(--oxblood))}
+.player .new:hover{background:var(--rust)}
+
+/* ---------- responsive ---------- */
+@media (max-width:1360px){
+  .proof .more{display:none}
+}
+@media (max-width:1100px){
+  .topbar .proof{display:none}
+  .doc-name .wide{display:none}
+  .doc-name .narrow{display:inline}
+}
+@media (max-width:1180px){
+  .grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .readout{display:none}
+  .ledger-wrap{grid-template-columns:1fr}
+}
+@media (max-width:900px){
+  body{overflow:hidden}
+  #app{margin:0;height:100dvh;border:0;grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr)}
+  .rail{display:none}
+  .topbar{height:68px}
+  .topbar .search,.topbar .grow,.topbar .proof{display:none}
+  .doc-name .wide{display:none}
+  .doc-name .narrow{display:inline}
+  .doc-thumb{width:68px}
+  .doc-thumb svg{width:40px;height:52px}
+  .doc-name{width:auto;flex:1;padding:0 14px;border-left:1px solid var(--ground)}
+  .doc-name small{display:block;overflow:hidden;text-overflow:ellipsis}
+  .bell{width:68px}
+  .toolbar{padding:16px 16px 14px;gap:10px}
+  .tabs{flex-wrap:nowrap;overflow-x:auto;width:100%}
+  .tab{flex:none}
+  .toolbar .grow{display:none}
+  .filter{flex:1;width:auto}
+  .types{padding:0 16px 14px}
+  .scroll{padding:0 16px 24px}
+  .player{margin:0;border-width:1px 0 0;grid-template-columns:minmax(0,1fr);gap:8px;padding:10px}
+  .player .thumb,.player .now,.chips{display:none}
+  .track{margin-right:58px}
+  .answer{margin-left:0}
+  .doc-view{grid-template-columns:1fr}
+  .doc-view > svg{width:150px;height:200px}
+  dl{grid-template-columns:120px minmax(0,1fr)}
+}
+@media (max-width:640px){
+  .grid{grid-template-columns:minmax(0,1fr)}
+  .passages li{grid-template-columns:22px minmax(0,1fr)}
+  .passages .pg{grid-column:2}
+  .passages li p{grid-column:2}
+}
+@media (prefers-reduced-motion:reduce){
+  .caret{animation:none}
+  .track.busy i{animation:none;transform:none;opacity:.5}
+  .passages summary .icon{transition:none}
 }
 </style>
 </head>
 <body>
 
-<div id="intro">
-  <div class="logo">NEURA</div>
-  <div class="sub">document intelligence</div>
-  <div class="bar"><i></i></div>
-</div>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-ask" viewBox="0 0 24 24"><path d="M3 5.5c3-1.3 6-1.3 9 .7 3-2 6-2 9-.7V19c-3-1.3-6-1.3-9 .7-3-2-6-2-9-.7z"/><path d="M12 6.2v13.5"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M4 5h16v11H9.5L4 20z"/><path d="M8 9.5h8M8 12.5h5"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+  <symbol id="i-evals" viewBox="0 0 24 24"><path d="M4 20h16M7 16.5v-5M12 16.5V7M17 16.5v-8"/></symbol>
+  <symbol id="i-doc" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/></symbol>
+  <symbol id="i-new" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13 7l4 4"/></symbol>
+  <symbol id="i-api" viewBox="0 0 24 24"><path d="M8 4C6 4 6 5 6 7v2c0 1.5-1 2.3-2 3 1 .7 2 1.5 2 3v2c0 2 0 3 2 3M16 4c2 0 2 1 2 3v2c0 1.5 1 2.3 2 3-1 .7-2 1.5-2 3v2c0 2 0 3-2 3"/></symbol>
+  <symbol id="i-source" viewBox="0 0 24 24"><circle cx="6" cy="5.5" r="2"/><circle cx="6" cy="18.5" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 7.5v9M18 10c0 4-4 4.5-10.5 7"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 8h9M17 8h3M4 16h3M11 16h9"/><circle cx="15" cy="8" r="2"/><circle cx="9" cy="16" r="2"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11"/><path d="M15.5 8.5V4.5h-11v11h4"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6.5 7l1 13h9l1-13"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="i-open" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v6H4V6h6"/></symbol>
+</svg>
 
-<canvas id="stars"></canvas>
-<div class="aurora a1"></div><div class="aurora a2"></div><div class="aurora a3"></div>
-<div class="grain"></div>
-
-<div id="shell">
-  <aside>
-    <div class="brand">
-      <div class="orb"></div>
-      <div><b>NEURA</b><span>RAG&nbsp;ENGINE</span></div>
+<div id="app">
+  <aside class="rail" aria-label="Main">
+    <div class="mark" role="img" aria-label="NEURA">
+      <svg viewBox="0 0 34 34" aria-hidden="true"><text x="17" y="28" text-anchor="middle" font-family="Hanken Grotesk, sans-serif" font-weight="800" font-size="31" fill="#E8892F">N</text></svg>
     </div>
-    <button id="newChat">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-      New conversation
-    </button>
-    <div class="hist-label">History</div>
-    <div id="sessions"></div>
-    <div class="side-foot"><span class="dot"></span> {{MODEL}} · MiniLM · Chroma</div>
+    <nav>
+      <button class="rail-btn" data-go="ask"><svg class="icon"><use href="#i-ask"/></svg>Ask</button>
+      <button class="rail-btn" data-go="history"><svg class="icon"><use href="#i-history"/></svg>History</button>
+      <button class="rail-btn" data-go="evals"><svg class="icon"><use href="#i-evals"/></svg>Evals</button>
+      <button class="rail-btn" data-go="doc"><svg class="icon"><use href="#i-doc"/></svg>Document</button>
+    </nav>
+    <div class="spacer"></div>
+    <nav class="bottom">
+      <button class="rail-btn" id="railNew"><svg class="icon"><use href="#i-new"/></svg>New chat</button>
+      <a class="rail-btn" href="/docs" target="_blank" rel="noopener"><svg class="icon"><use href="#i-api"/></svg>API</a>
+      <a class="rail-btn" href="https://github.com/daivraval/neura-rag-chat" target="_blank" rel="noopener"><svg class="icon"><use href="#i-source"/></svg>Source</a>
+    </nav>
   </aside>
 
+  <header class="topbar">
+    <label class="search">
+      <svg class="icon"><use href="#i-search"/></svg>
+      <span class="sr">Search your chats</span>
+      <input id="chatSearch" type="search" placeholder="Search your chats" autocomplete="off"/>
+    </label>
+    <div class="grow"></div>
+    <button class="cell proof" id="proof" data-go="evals" hidden title="Open the eval results"><span id="proofText"></span></button>
+    <div class="cell doc-thumb" aria-hidden="true"><svg viewBox="0 0 84 112" id="thumbTop"></svg></div>
+    <button class="cell doc-name" data-go="doc" aria-label="Open document details">
+      <span><b id="docTitle">Loading document…</b><small id="docMeta"><span class="wide">&nbsp;</span><span class="narrow"></span></small></span>
+      <svg class="icon"><use href="#i-down"/></svg>
+    </button>
+    <button class="cell bell" id="topNew" aria-label="New chat" title="New chat"><svg class="icon"><use href="#i-new"/></svg></button>
+  </header>
+
   <main>
-    <header>
-      <div class="title" id="chatTitle">New conversation</div>
-      <div class="tag">grounded · document-only</div>
-    </header>
-
-    <div id="feed">
-      <div id="hero">
-        <h1>Ask your documents<br><span class="grad">anything at all.</span></h1>
-        <p>NEURA retrieves the most relevant passages from your indexed PDFs using
-           similarity search over a Chroma vector store, then answers with a
-           grounded language model. If the answer isn't in the document, it says so.</p>
-        <div class="chips">
-          <div class="chip">Summarize the document</div>
-          <div class="chip">What are the key findings?</div>
-          <div class="chip">Explain the methodology</div>
-          <div class="chip">List the conclusions</div>
-        </div>
+    <div class="toolbar">
+      <div class="tabs" role="tablist" aria-label="Views">
+        <button class="tab" role="tab" data-view="ask" aria-selected="true">Ask</button>
+        <button class="tab" role="tab" data-view="chat" aria-selected="false" hidden>Chat</button>
+        <button class="tab" role="tab" data-view="history" aria-selected="false">History</button>
+        <button class="tab" role="tab" data-view="evals" aria-selected="false">Evals</button>
+        <button class="tab" role="tab" data-view="doc" aria-selected="false">Document</button>
       </div>
-      <div class="feed-inner" id="feedInner"></div>
+      <div class="grow"></div>
+      <label class="filter" id="filterBox">
+        <svg class="icon"><use href="#i-search"/></svg>
+        <span class="sr">Filter</span>
+        <input id="filter" type="search" placeholder="Search in questions" autocomplete="off"/>
+      </label>
+      <button class="filter-btn" id="filterBtn" aria-expanded="false" aria-controls="types" title="Filter by question type">
+        <svg class="icon"><use href="#i-filter"/></svg><span class="sr">Filter by type</span>
+      </button>
+    </div>
+    <div class="types" id="types" hidden></div>
+
+    <div class="scroll" id="scroll">
+      <section class="view" id="view-ask" aria-label="Suggested questions"><div class="grid" id="shelf"></div></section>
+      <section class="view" id="view-chat" hidden aria-label="Conversation"><div class="thread" id="thread"></div></section>
+      <section class="view" id="view-history" hidden aria-label="Chat history"><div class="grid" id="history"></div></section>
+      <section class="view" id="view-evals" hidden aria-label="Eval results"><div id="evals"></div></section>
+      <section class="view" id="view-doc" hidden aria-label="Document"><div id="doc"></div></section>
     </div>
 
-    <div id="composer">
-      <div class="comp-inner">
-        <div class="comp-box">
-          <textarea id="input" rows="1" placeholder="Ask something about your document…"></textarea>
-          <button id="send" aria-label="send">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
-          </button>
+    <form class="player" id="composer" autocomplete="off">
+      <div class="thumb" aria-hidden="true"><svg viewBox="0 0 84 112" id="thumbPlayer"></svg></div>
+      <div class="now"><b id="nowTitle">Ask the paper</b><small id="nowBy">&nbsp;</small></div>
+      <div class="deck">
+        <div class="deck-row">
+          <label class="sr" for="input">Your question</label>
+          <textarea id="input" rows="1" placeholder="Ask about the document…" title="Enter to ask, Shift+Enter for a new line"></textarea>
+          <button class="send" id="send" type="submit" aria-label="Ask NEURA"><svg class="icon"><use href="#i-send"/></svg></button>
         </div>
+        <div class="track" id="track" aria-hidden="true"><i></i><b></b></div>
       </div>
-      <div class="hint">ENTER TO SEND · SHIFT+ENTER FOR NEW LINE</div>
-    </div>
+      <div class="chips">
+        <span class="readout" id="chipK">k 4 · temp 0</span>
+        <button class="new" type="button" id="playerNew" aria-label="New chat" title="New chat"><svg class="icon"><use href="#i-new"/></svg></button>
+      </div>
+    </form>
   </main>
 </div>
 
 <script>
-/* ============ particle constellation background ============ */
-const cv = document.getElementById('stars'), cx = cv.getContext('2d');
-let W, H, pts = [], mouse = {x:-1e4, y:-1e4};
-function resize(){ W = cv.width = innerWidth; H = cv.height = innerHeight; }
-resize(); addEventListener('resize', resize);
-addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
-const N = Math.min(110, innerWidth / 12);
-for (let i = 0; i < N; i++) pts.push({
-  x: Math.random()*innerWidth, y: Math.random()*innerHeight,
-  vx: (Math.random()-.5)*.35, vy: (Math.random()-.5)*.35,
-  r: Math.random()*1.6 + .4
-});
-function tick(){
-  cx.clearRect(0,0,W,H);
-  for (const p of pts){
-    p.x += p.vx; p.y += p.vy;
-    if (p.x < 0 || p.x > W) p.vx *= -1;
-    if (p.y < 0 || p.y > H) p.vy *= -1;
-    const dm = Math.hypot(p.x-mouse.x, p.y-mouse.y);
-    if (dm < 160){ p.x += (p.x-mouse.x)/dm*.6; p.y += (p.y-mouse.y)/dm*.6; }
-    cx.beginPath(); cx.arc(p.x, p.y, p.r, 0, 7);
-    cx.fillStyle = 'rgba(160,170,255,.5)'; cx.fill();
-  }
-  for (let i = 0; i < pts.length; i++) for (let j = i+1; j < pts.length; j++){
-    const a = pts[i], b = pts[j], d = Math.hypot(a.x-b.x, a.y-b.y);
-    if (d < 130){
-      cx.beginPath(); cx.moveTo(a.x,a.y); cx.lineTo(b.x,b.y);
-      cx.strokeStyle = `rgba(124,92,255,${(1-d/130)*.16})`; cx.stroke();
-    }
-  }
-  requestAnimationFrame(tick);
-}
-tick();
-
-/* ============ app state ============ */
 const $ = s => document.querySelector(s);
-const feed = $('#feedInner'), feedWrap = $('#feed'), hero = $('#hero');
-const input = $('#input'), sendBtn = $('#send');
-let sessionId = null, busy = false;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const REFUSAL = /could not find the answer in the document/i;
+const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
 
-setTimeout(() => $('#intro').classList.add('gone'), 1600);
+/* ---------- covers: one authored tile per question type ---------- */
+const COVERS = {
+  definition: {bg:'#9F2E10', ink:'#F1B978', motif:'<path d="M20 26h-6v26h6M64 26h6v26h-6" fill="none" stroke-width="3"/><path d="M27 34h30M27 41h22M27 48h26" stroke-width="2"/>'},
+  method:     {bg:'#4B3F29', ink:'#E8892F', motif:'<rect x="14" y="24" width="14" height="10" fill="none" stroke-width="2.5"/><rect x="35" y="36" width="14" height="10" fill="none" stroke-width="2.5"/><rect x="56" y="48" width="14" height="10" fill="none" stroke-width="2.5"/><path d="M28 29h14v7M49 41h14v7" fill="none" stroke-width="2"/>'},
+  numeric:    {bg:'#E8892F', ink:'#16130E', motif:[0,1,2,3].map(r => [0,1,2,3,4].map(c => `<circle cx="${18+c*12}" cy="${26+r*10}" r="${(r*5+c)%3===0?3:1.6}"/>`).join('')).join('')},
+  table:      {bg:'#F1B978', ink:'#5B1408', motif:'<path d="M12 24h60M12 34h60M12 44h60M12 54h60M32 24v30M52 24v30" fill="none" stroke-width="2"/><path d="M12 24h60" stroke-width="4"/>'},
+  trap:       {bg:'#16130E', ink:'#9F2E10', motif:'<rect x="22" y="20" width="40" height="40" fill="none" stroke-width="2.5"/><path d="M16 66L68 14" stroke-width="3.5"/>'},
+  chat:       {bg:'#4B3F29', ink:'#F1B978', motif:'<path d="M14 22h56v26H34l-12 10V48h-8z" fill="none" stroke-width="2.5"/><path d="M22 31h38M22 39h26" stroke-width="2"/>'},
+  doc:        {bg:'#5B1408', ink:'#F1B978', motif:''},
+};
+function cover(kind, big){
+  const c = COVERS[kind] || COVERS.chat;
+  return `<rect width="84" height="112" fill="${c.bg}"/>`
+    + (kind === 'trap' ? `<rect x=".75" y=".75" width="82.5" height="110.5" fill="none" stroke="#9F2E10" stroke-width="1.5"/>` : '')
+    + `<g fill="${c.ink}" stroke="${c.ink}">${c.motif}</g>`
+    + `<text x="10" y="98" fill="${c.ink}" font-family="Hanken Grotesk, sans-serif" font-weight="800" font-size="26" letter-spacing="-1">${esc(big)}</text>`;
+}
+function docCover(){
+  return `<rect width="84" height="112" fill="#5B1408"/>`
+    + `<rect x="7" y="7" width="70" height="98" fill="none" stroke="#9F2E10" stroke-width="1.2"/>`
+    + `<text x="13" y="44" fill="#F1B978" font-family="Hanken Grotesk, sans-serif" font-weight="800" font-size="27" letter-spacing="-1.4">DPR</text>`
+    + `<path d="M13 52h58M13 57h44M13 62h52" stroke="#E8892F" stroke-width="1.6"/>`
+    + `<rect x="13" y="70" width="34" height="4" fill="#E8892F"/>`
+    + `<text x="13" y="96" fill="#F1B978" font-family="Courier Prime, monospace" font-size="8" letter-spacing=".8">EMNLP 2020</text>`;
+}
+['#thumbTop', '#thumbPlayer'].forEach(s => $(s).innerHTML = docCover());
 
-/* ---------- sessions ---------- */
+/* ---------- the shelf: real questions from the golden set ---------- */
+const SHELF = [
+  {q:'How many passages does the final Wikipedia corpus contain?', type:'numeric', page:4, sec:'§4.1 Wikipedia Data',
+   blurb:'One exact figure from the data section. A rounded answer still has to name the right count.'},
+  {q:'How does DPR measure the similarity between a question and a passage?', type:'definition', page:3, sec:'§3.1 Overview',
+   blurb:'The retriever’s core design choice, defined as Equation 1 in the paper.'},
+  {q:'What top-20 retrieval accuracy does the multi-dataset DPR reach on TREC?', type:'table', page:5, sec:'Table 2',
+   blurb:'One cell from the main results table, read from a row of ten numbers.'},
+  {q:'What exact match score does DPR get on HotpotQA?', type:'trap', page:null, sec:null,
+   blurb:'The paper never evaluates on HotpotQA. The only correct answer is a refusal.'},
+  {q:'Which three types of negative passages does the paper consider?', type:'method', page:3, sec:'§3.2 Training',
+   blurb:'A three-part answer from the training section. Leaving one out counts as wrong.'},
+  {q:'How long does it take to build the FAISS index for 21 million passages?', type:'numeric', page:7, sec:'§5.4 Run-time Efficiency',
+   blurb:'Indexing cost from the efficiency section, set next to the Lucene comparison.'},
+  {q:'Why does the paper think DPR performs worse on SQuAD?', type:'method', page:5, sec:'§5.1 Main Results',
+   blurb:'An explanation, not a number. The answer is the paper’s own reasoning about how the dataset was built.'},
+  {q:'What exact match score does jointly training the retriever and reader get on Natural Questions?', type:'table', page:8, sec:'§6.2 Results',
+   blurb:'The ablation behind the paper’s pipeline choice: training the two parts together instead of apart.'},
+  {q:'What does the self-attention mechanism in a transformer compute?', type:'trap', page:null, sec:null,
+   blurb:'The model knows this one, but the paper never explains it. NEURA should still refuse.'},
+];
+const TYPES = ['definition', 'method', 'numeric', 'table', 'trap'];
+
+function shelfCard(item){
+  const el = document.createElement('article');
+  el.className = 'card';
+  el.dataset.type = item.type;
+  el.dataset.text = item.q.toLowerCase();
+  const trap = item.type === 'trap';
+  el.innerHTML = `
+    <div class="card-top">
+      <div class="cover-col">
+        <svg viewBox="0 0 84 112" aria-hidden="true">${cover(item.type, trap ? 'n/a' : 'p.' + item.page)}</svg>
+        <span class="meta">${trap ? 'not in<br>the paper' : 'page ' + item.page + '<br>' + item.type}</span>
+      </div>
+      <div>
+        <h3>${esc(item.q)}</h3>
+        <p class="by">${trap ? 'Trap question' : `From <a href="/pdf#page=${item.page}" target="_blank" rel="noopener">${esc(item.sec)}</a>`}</p>
+        <p class="blurb">${esc(item.blurb)}</p>
+      </div>
+    </div>
+    <button class="primary" type="button">Ask NEURA</button>
+    <div class="actions">
+      <button class="act" type="button" data-act="edit"><svg class="icon"><use href="#i-edit"/></svg>Edit first</button>
+      <button class="act" type="button" data-act="copy"><svg class="icon"><use href="#i-copy"/></svg><span>Copy</span></button>
+    </div>`;
+  el.querySelector('.primary').onclick = () => ask(item.q);
+  el.querySelector('[data-act="edit"]').onclick = () => { input.value = item.q; grow(); input.focus(); };
+  el.querySelector('[data-act="copy"]').onclick = async e => {
+    const label = e.currentTarget.querySelector('span');
+    try { await navigator.clipboard.writeText(item.q); label.textContent = 'Copied'; }
+    catch { label.textContent = 'Copy failed'; }
+    setTimeout(() => label.textContent = 'Copy', 1400);
+  };
+  return el;
+}
+const shelf = $('#shelf');
+SHELF.forEach(item => shelf.appendChild(shelfCard(item)));
+
+/* ---------- type filter chips ---------- */
+const activeTypes = new Set();
+TYPES.forEach(t => {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'type-chip'; b.textContent = t; b.setAttribute('aria-pressed', 'false');
+  b.onclick = () => {
+    activeTypes.has(t) ? activeTypes.delete(t) : activeTypes.add(t);
+    b.setAttribute('aria-pressed', activeTypes.has(t));
+    applyFilter();
+  };
+  $('#types').appendChild(b);
+});
+$('#filterBtn').onclick = () => {
+  const open = $('#types').hidden;
+  $('#types').hidden = !open;
+  $('#filterBtn').setAttribute('aria-expanded', open);
+};
+
+/* ---------- views ---------- */
+let view = 'ask', sessionId = null, sessionTitle = '', busy = false;
+const scroller = $('#scroll');
+const FILTER_HINT = {ask:'Search in questions', history:'Search your chats'};
+function setView(v){
+  view = v;
+  document.querySelectorAll('.tab').forEach(t => t.setAttribute('aria-selected', t.dataset.view === v));
+  document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
+  document.querySelectorAll('.rail-btn[data-go]').forEach(b => {
+    if (b.dataset.go === v) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+  });
+  const filterable = v === 'ask' || v === 'history';
+  $('#filterBox').style.visibility = filterable ? 'visible' : 'hidden';
+  $('#filterBtn').style.visibility = v === 'ask' ? 'visible' : 'hidden';
+  if (v !== 'ask') { $('#types').hidden = true; $('#filterBtn').setAttribute('aria-expanded', 'false'); }
+  if (filterable) $('#filter').placeholder = FILTER_HINT[v];
+  if (v === 'history') loadSessions();
+  if (v === 'evals') loadEvals();
+  if (v !== 'chat') scroller.scrollTop = 0;
+  applyFilter();
+}
+document.querySelectorAll('[data-view]').forEach(t => t.onclick = () => setView(t.dataset.view));
+document.querySelectorAll('[data-go]').forEach(b => b.onclick = () => setView(b.dataset.go));
+
+function applyFilter(){
+  const q = $('#filter').value.trim().toLowerCase();
+  const grid = view === 'history' ? $('#history') : shelf;
+  grid.querySelectorAll('.card').forEach(c => {
+    const typeOk = view !== 'ask' || !activeTypes.size || activeTypes.has(c.dataset.type);
+    c.hidden = !(typeOk && (!q || c.dataset.text.includes(q)));
+  });
+}
+$('#filter').addEventListener('input', applyFilter);
+$('#chatSearch').addEventListener('input', e => {
+  $('#filter').value = e.target.value;
+  if (view !== 'history') setView('history'); else applyFilter();
+});
+
+/* ---------- info + evals ---------- */
+let info = null;
+async function loadInfo(){
+  try { info = await (await fetch('/api/info')).json(); } catch { return; }
+  const d = info.document;
+  $('#docTitle').textContent = d.short;
+  $('#docMeta .wide').textContent = `${d.byline} · ${info.chunks} chunks`;
+  $('#nowBy').textContent = `By: ${d.byline} | Model: ${info.model}`;
+  $('#chipK').textContent = `k ${info.retrieval.k} · temp 0`;
+  renderDoc();
+}
+
+function renderDoc(){
+  const d = info.document;
+  const r = info.retrieval;
+  $('#doc').innerHTML = `
+    <div class="doc-view">
+      <svg viewBox="0 0 84 112" aria-hidden="true">${docCover()}</svg>
+      <div>
+        <h2>${esc(d.title)}</h2>
+        <p class="by">${esc(d.authors)}</p>
+        <dl>
+          <dt>Published</dt><dd>${esc(d.venue)}</dd>
+          <dt>License</dt><dd>${esc(d.license)}</dd>
+          <dt>Indexed as</dt><dd>${info.chunks} chunks of ${info.chunk_size} characters, ${info.chunk_overlap} overlap</dd>
+          <dt>Embeddings</dt><dd>${esc(info.embeddings)}, run locally</dd>
+          <dt>Retrieval</dt><dd>${esc(r.search_type)} search, top ${r.k} passages per question</dd>
+          <dt>Answers</dt><dd>${esc(info.model)} on ${esc(info.provider)}, temperature 0</dd>
+        </dl>
+        <div class="doc-actions">
+          <a class="primary" href="/pdf" target="_blank" rel="noopener"><svg class="icon"><use href="#i-open"/></svg>Open the PDF</a>
+          <a class="act" href="${esc(d.url)}" target="_blank" rel="noopener">ACL Anthology page</a>
+        </div>
+      </div>
+    </div>`;
+}
+
+let evalsP = null, evalsLoaded = false;
+const getEvals = () => evalsP || (evalsP = fetch('/api/evals').then(r => r.json()));
+const refusedCount = a => Math.round(a.refusal_accuracy * a.traps);
+async function loadProof(){
+  let a;
+  try { a = (await getEvals()).answers; } catch { return; }
+  if (!a) return;
+  $('#proofText').innerHTML = `Traps refused ${refusedCount(a)}/${a.traps}<span class="more"> · Answers correct ${pct(a.answer_accuracy)}</span>`;
+  $('#proof').hidden = false;
+  $('#docMeta .narrow').textContent = `${refusedCount(a)}/${a.traps} traps refused`;
+}
+async function loadEvals(){
+  if (evalsLoaded) return;
+  let e;
+  try { e = await getEvals(); } catch { evalsP = null; $('#evals').innerHTML = '<p class="empty">Could not load the eval reports.</p>'; return; }
+  evalsLoaded = true;
+  const a = e.answers, r = e.retrieval;
+  const answers = a ? `
+    <section class="panel">
+      <h2>Answers</h2>
+      <div class="rows">
+        <div class="row"><b>Hallucination rate</b><span>${a.traps - refusedCount(a)} of ${a.traps} traps answered anyway</span><em class="v">${pct(a.hallucination_rate)}</em></div>
+        <div class="row"><b>Refusal accuracy</b><span>${refusedCount(a)} of ${a.traps} trap questions refused</span><em class="v">${pct(a.refusal_accuracy)}</em></div>
+        <div class="row"><b>Answer accuracy</b><span>Every expected fact present</span><em class="v">${pct(a.answer_accuracy)}</em></div>
+        <div class="row"><b>False refusals</b><span>Answerable questions refused</span><em class="v">${pct(a.false_refusal_rate)}</em></div>
+        <div class="row"><b>Faithfulness</b><span>Judged by ${esc((a.judge || 'an LLM judge').split(' on ')[0])}</span><em class="v">${pct(a.faithfulness)}</em></div>
+      </div>
+      <p class="sub">${a.questions} questions · ${esc(a.model)} · ${esc(a.generated)}</p>
+    </section>` : `
+    <section class="panel"><h2>Answers</h2>
+      <p class="sub">No answer eval saved yet. Run <code>python -m evals.run_eval generation --judge</code>.</p></section>`;
+  const retrieval = r ? `
+    <section class="panel">
+      <h2>Retrieval</h2>
+      <table>
+        <thead><tr><th>Config</th><th class="n">Evidence hit</th><th class="n">MRR</th><th class="n">Page hit</th></tr></thead>
+        <tbody>${r.configs.map(c => `
+          <tr class="${c.name === 'app' ? 'ship' : ''}">
+            <td>${c.name === 'app' ? 'shipped' : esc(c.name)}<small>${esc(c.config)}</small></td>
+            <td class="n">${pct(c.hit)}</td><td class="n">${c.mrr.toFixed(3)}</td><td class="n">${pct(c.page_hit)}</td>
+          </tr>`).join('')}</tbody>
+      </table>
+      <p class="sub">${r.answerable} answerable questions · offline, no LLM calls · ${esc(r.generated)}</p>
+    </section>` : '';
+  $('#evals').innerHTML = `<div class="ledger-wrap">${answers}${retrieval}</div>`;
+}
+
+/* ---------- history ---------- */
 async function loadSessions(){
   const rows = await (await fetch('/api/sessions')).json();
-  const box = $('#sessions'); box.innerHTML = '';
-  rows.forEach((s, i) => {
-    const el = document.createElement('div');
-    el.className = 'sess' + (s.id === sessionId ? ' active' : '');
-    el.style.animationDelay = (i * 40) + 'ms';
-    el.innerHTML = `<div class="t"></div><div class="m">${s.n} messages</div>
-      <button class="del" title="delete">✕</button>`;
-    el.querySelector('.t').textContent = s.title;
-    el.onclick = () => openSession(s.id, s.title);
-    el.querySelector('.del').onclick = async e => {
-      e.stopPropagation();
+  const box = $('#history'); box.innerHTML = '';
+  if (!rows.length){
+    box.innerHTML = '<div class="empty"><b>No chats yet</b>Pick a question from the Ask shelf, or type one in the player bar below.</div>';
+    return;
+  }
+  rows.forEach(s => {
+    const el = document.createElement('article');
+    el.className = 'card';
+    el.dataset.text = s.title.toLowerCase();
+    const when = new Date(s.created_at);
+    const answers = Math.ceil(s.n / 2);
+    el.innerHTML = `
+      <div class="card-top">
+        <div class="cover-col">
+          <svg viewBox="0 0 84 112" aria-hidden="true">${cover('chat', String(answers))}</svg>
+          <span class="meta">${s.n} messages</span>
+        </div>
+        <div>
+          <h3></h3>
+          <p class="by">Started ${when.toLocaleDateString(undefined, {month:'short', day:'numeric'})}, ${when.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'})}</p>
+          <p class="blurb"></p>
+        </div>
+      </div>
+      <button class="primary" type="button">Open chat</button>
+      <div class="actions one"><button class="act danger" type="button"><svg class="icon"><use href="#i-trash"/></svg>Delete chat</button></div>`;
+    el.querySelector('h3').textContent = s.title;
+    el.querySelector('.blurb').textContent = s.preview || 'No answer yet.';
+    el.querySelector('.primary').onclick = () => openSession(s.id, s.title);
+    el.querySelector('.danger').onclick = async () => {
       await fetch('/api/sessions/' + s.id, {method:'DELETE'});
-      if (s.id === sessionId) newChat();
+      if (s.id === sessionId) resetChat();
       loadSessions();
     };
     box.appendChild(el);
   });
+  applyFilter();
 }
 
-async function openSession(id, title){
-  sessionId = id; busy = false;
-  $('#chatTitle').textContent = title;
-  hero.style.display = 'none'; feed.innerHTML = '';
-  const data = await (await fetch('/api/sessions/' + id)).json();
-  for (const m of data.messages)
-    addMsg(m.role, m.content, m.sources ? m.sources.split(' ||| ') : null, false);
-  loadSessions();
-  feedWrap.scrollTop = feedWrap.scrollHeight;
+/* ---------- thread ---------- */
+const thread = $('#thread');
+function showChatTab(title){
+  const tab = $('.tab[data-view="chat"]');
+  tab.hidden = false;
+  sessionTitle = title;
+  $('#nowTitle').textContent = title || 'Ask the paper';
 }
-
-function newChat(){
-  sessionId = null; feed.innerHTML = '';
-  hero.style.display = 'block';
-  $('#chatTitle').textContent = 'New conversation';
-  loadSessions();
+function threadHeading(title){
+  thread.innerHTML = '';
+  const h = document.createElement('h2');
+  h.textContent = title;
+  thread.appendChild(h);
 }
-$('#newChat').onclick = newChat;
-
-/* ---------- messages ---------- */
-function addMsg(role, text, sources, animate = true){
+function addQuestion(text){
   const el = document.createElement('div');
-  el.className = 'msg ' + role;
-  if (!animate) el.style.animation = 'none';
-  el.innerHTML = `<div class="avatar">${role === 'user' ? 'YOU' : 'AI'}</div>
-                  <div class="bubble"></div>`;
-  const bub = el.querySelector('.bubble');
-  bub.textContent = text;
-  if (sources && sources.length && sources[0]){
+  el.className = 'turn';
+  el.innerHTML = `<svg viewBox="0 0 84 112" aria-hidden="true">${cover('chat', 'Q')}</svg><div><h3></h3></div>`;
+  el.querySelector('h3').textContent = text;
+  thread.appendChild(el);
+}
+function addAnswer(){
+  const el = document.createElement('article');
+  el.className = 'answer';
+  el.innerHTML = `<header><span>NEURA · ${esc(info ? info.model : 'model')}</span><span class="state">Answer</span></header>
+    <div class="answer-text"></div>`;
+  thread.appendChild(el);
+  return el;
+}
+function finishAnswer(el, text, sources){
+  const refused = REFUSAL.test(text);
+  el.classList.toggle('refused', refused);
+  el.querySelector('.state').textContent = refused ? 'Not in the document' : 'Grounded answer';
+  if (sources && sources.length){
     const det = document.createElement('details');
-    det.className = 'src';
-    det.innerHTML = '<summary>retrieved context</summary>';
+    det.className = 'passages';
+    det.innerHTML = `<summary>Retrieved passages · ${sources.length}<svg class="icon"><use href="#i-down"/></svg></summary><ol></ol>`;
+    const ol = det.querySelector('ol');
     sources.forEach(s => {
-      const d = document.createElement('div');
-      d.className = 'snip'; d.textContent = s + '…';
-      det.appendChild(d);
+      const src = typeof s === 'string' ? {text:s, page:null} : s;
+      const li = document.createElement('li');
+      li.innerHTML = `<span class="pg">${src.page ? `<a href="/pdf#page=${src.page}" target="_blank" rel="noopener">page ${src.page}</a>` : ''}</span><p></p>`;
+      li.querySelector('p').textContent = src.text + '…';
+      ol.appendChild(li);
     });
-    bub.appendChild(det);
+    el.appendChild(det);
   }
-  feed.appendChild(el);
-  feedWrap.scrollTop = feedWrap.scrollHeight;
-  return bub;
+}
+async function openSession(id, title){
+  const data = await (await fetch('/api/sessions/' + id)).json();
+  sessionId = id;
+  showChatTab(data.title);
+  threadHeading(data.title);
+  for (const m of data.messages){
+    if (m.role === 'user') addQuestion(m.content);
+    else { const a = addAnswer(); a.querySelector('.answer-text').textContent = m.content; finishAnswer(a, m.content, m.sources); }
+  }
+  setView('chat');
+  scroller.scrollTop = scroller.scrollHeight;
+}
+function resetChat(){
+  sessionId = null;
+  thread.innerHTML = '';
+  $('.tab[data-view="chat"]').hidden = true;
+  $('#nowTitle').textContent = 'Ask the paper';
+  setTrack('idle');
+  setView('ask');
+  input.focus();
+}
+['#railNew', '#topNew', '#playerNew'].forEach(s => $(s).onclick = resetChat);
+
+/* ---------- player track: the signature moment ---------- */
+const track = $('#track');
+function setTrack(mode, p = 0){
+  track.classList.toggle('busy', mode === 'busy');
+  track.style.setProperty('--p', mode === 'play' ? p / 100 : 0);
 }
 
-function typeInto(bub, text, sources){
-  return new Promise(res => {
-    bub.textContent = '';
+function typeInto(box, text){
+  return new Promise(done => {
+    box.textContent = '';
     const caret = document.createElement('span'); caret.className = 'caret';
-    bub.appendChild(caret);
+    box.appendChild(caret);
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const step = reduce ? text.length : Math.max(1, Math.round(text.length / 200));
     let i = 0;
-    const step = Math.max(1, Math.round(text.length / 220));
-    (function go(){
+    (function tick(){
       if (i < text.length){
         caret.before(document.createTextNode(text.slice(i, i + step)));
         i += step;
-        feedWrap.scrollTop = feedWrap.scrollHeight;
-        setTimeout(go, 12);
-      } else {
-        caret.remove();
-        if (sources && sources.length){
-          const det = document.createElement('details');
-          det.className = 'src';
-          det.innerHTML = '<summary>retrieved context</summary>';
-          sources.forEach(s => {
-            const d = document.createElement('div');
-            d.className = 'snip'; d.textContent = s + '…';
-            det.appendChild(d);
-          });
-          bub.appendChild(det);
-        }
-        feedWrap.scrollTop = feedWrap.scrollHeight;
-        res();
-      }
+        setTrack('play', Math.min(100, i / text.length * 100));
+        scroller.scrollTop = scroller.scrollHeight;
+        setTimeout(tick, 12);
+      } else { caret.remove(); setTrack('play', 100); done(); }
     })();
   });
 }
 
-async function send(){
-  const q = input.value.trim();
+/* ---------- asking ---------- */
+const input = $('#input'), sendBtn = $('#send');
+function grow(){ input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 120) + 'px'; }
+input.addEventListener('input', grow);
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); ask(input.value); }
+});
+$('#composer').addEventListener('submit', e => { e.preventDefault(); ask(input.value); });
+
+async function ask(text){
+  const q = text.trim();
   if (!q || busy) return;
   busy = true; sendBtn.disabled = true;
-  input.value = ''; input.style.height = 'auto';
-  hero.style.display = 'none';
-  addMsg('user', q);
-  const bub = addMsg('ai', '');
-  bub.innerHTML = '<div class="thinking"><i></i><i></i><i></i></div>';
+  input.value = ''; grow();
+  if (!sessionId){ showChatTab(q); threadHeading(q); }
+  setView('chat');
+  addQuestion(q);
+  const a = addAnswer();
+  const box = a.querySelector('.answer-text');
+  box.innerHTML = '<span class="wait">Retrieving passages and writing an answer…</span>';
+  a.querySelector('.state').textContent = 'Working';
+  scroller.scrollTop = scroller.scrollHeight;
+  setTrack('busy');
   try {
-    const r = await fetch('/api/chat', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: sessionId, message: q})
-    });
-    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const r = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({session_id: sessionId, message: q})});
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
     const data = await r.json();
     sessionId = data.session_id;
-    await typeInto(bub, data.answer, data.sources);
-    loadSessions();
+    await typeInto(box, data.answer);
+    finishAnswer(a, data.answer, data.sources);
   } catch (err) {
-    bub.textContent = '⚠ ' + err.message;
+    setTrack('idle');
+    a.classList.add('failed');
+    a.querySelector('.state').textContent = 'Request failed';
+    box.textContent = `NEURA couldn’t answer (${err.message}). Wait a moment and ask again; the server log has details.`;
   }
   busy = false; sendBtn.disabled = false; input.focus();
 }
 
-sendBtn.onclick = send;
-input.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
-});
-input.addEventListener('input', () => {
-  input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 140) + 'px';
-});
-document.querySelectorAll('.chip').forEach(c =>
-  c.onclick = () => { input.value = c.textContent; send(); });
-
-loadSessions();
+const startView = location.hash.slice(1);
+setView(['history', 'evals', 'doc'].includes(startView) ? startView : 'ask');
+loadInfo();
+loadProof();
 </script>
 </body>
 </html>"""

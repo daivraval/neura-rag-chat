@@ -3,7 +3,7 @@
 <img width="100%" src="https://capsule-render.vercel.app/api?type=waving&color=0:6f5bf5,45:3b9dfc,100:2fd6c4&height=190&section=header&text=NEURA&fontSize=78&fontColor=ffffff&animation=fadeIn&fontAlignY=36&desc=a%20document%20RAG%20chat%20engine%20that%20refuses%20to%20guess&descAlignY=57&descSize=17" alt="NEURA" />
 
 <a href="https://github.com/daivraval/neura-rag-chat">
-  <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&duration=3200&pause=900&color=2FD6C4&center=true&vCenter=true&width=680&lines=Ask+your+documents+anything+at+all.;Refused+12%2F12+trap+questions+in+eval+%E2%80%94+0%25+hallucinations;Grounded+in+your+PDF+%E2%80%94+or+it+says+it+doesn't+know;No+build+step.+No+node_modules.+Just+python+app.py" alt="typing" />
+  <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&duration=3200&pause=900&color=2FD6C4&center=true&vCenter=true&width=680&lines=Ask+your+documents+anything+at+all.;54-question+eval%3A+every+wrong+answer+traced+to+retrieval;Grounded+in+your+PDF+%E2%80%94+or+it+says+it+doesn't+know;No+build+step.+No+node_modules.+Just+python+app.py" alt="typing" />
 </a>
 
 <br/>
@@ -54,7 +54,7 @@ flowchart LR
     end
 ```
 
-**Why plain similarity and not MMR?** NEURA originally used Maximal Marginal Relevance, which trades some relevance for diversity so the 4 chunks aren't near-duplicates. The [eval](#evaluation) showed that trade was a bad one on this paper. MMR found the answering passage 69% of the time, plain similarity 83%, and answer accuracy rose from 78.6% to 85.7% after the switch. For pinpoint questions ("which loss function?") the chunk MMR drops for being "too similar" is often the one with the answer. MMR is still in the eval as a baseline (`--config mmr`).
+**Why plain similarity and not MMR?** NEURA originally used Maximal Marginal Relevance, which trades some relevance for diversity so the 4 chunks aren't near-duplicates. The [eval](#evaluation) showed that trade was a bad one. On the indexed paper MMR found the answering passage 43% of the time and plain similarity 60%, and answer accuracy is 69.0% with similarity against 61.9% with MMR. For pinpoint questions ("which optimizer?", "what dropout rate?") the chunk MMR drops for being "too similar" is often the one with the answer. MMR is still in the eval as a baseline (`--config mmr`).
 
 ---
 
@@ -66,9 +66,9 @@ Every knob that shapes an answer, in one place:
 |---|---|---|---|
 | Chunking | `chunk_size` / `chunk_overlap` | `1000` / `200` | Big enough to hold a full argument, 20% overlap so ideas aren't severed at a boundary |
 | Embedding | `all-MiniLM-L6-v2` | local, 384-dim | Runs on CPU — indexing costs nothing and never leaves the machine |
-| Search | `search_type` | `similarity` | Won the eval: 83.3% evidence hit@4 vs 69.0% for MMR |
+| Search | `search_type` | `similarity` | Beat MMR in the eval: 59.5% evidence hit@4 vs 42.9% |
 | Search | `k` | `4` | Four passages, ~4000 characters of context |
-| Generation | `openai/gpt-oss-120b` | Groq (swappable) | Strongest production model on Groq free tier; 100% refusal accuracy in the eval. `LLM_PROVIDER` / `LLM_MODEL` switch to Hugging Face or OpenAI |
+| Generation | `openai/gpt-oss-120b` | Groq (swappable) | Strongest production model on Groq free tier; refused 10 of 12 trap questions in the eval. `LLM_PROVIDER` / `LLM_MODEL` switch to Hugging Face or OpenAI |
 | Generation | `max_tokens` | `400` | Long enough to explain, short enough to stay on-context |
 | Generation | `temperature` | `0` | Deterministic — reproducible answers |
 
@@ -116,6 +116,9 @@ The frontend is just a client. Everything is reachable over HTTP:
 | `POST` | `/api/sessions` | Start an empty conversation |
 | `GET` | `/api/sessions/{id}` | Full transcript with source snippets |
 | `DELETE` | `/api/sessions/{id}` | Delete a conversation and its messages |
+| `GET` | `/api/info` | The indexed document and pipeline settings (chunks, retrieval, model) |
+| `GET` | `/api/evals` | Headline numbers from the saved eval reports in `evals/results/` |
+| `GET` | `/pdf` | The indexed PDF itself, so `/pdf#page=5` opens a cited page |
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/chat \
@@ -123,7 +126,7 @@ curl -X POST http://127.0.0.1:8000/api/chat \
   -d '{"message":"What methodology does the paper use?"}'
 ```
 
-Omit `session_id` and the server mints one, naming the conversation from your first 48 characters. Every reply ships the three passages it was built from, so you can check the answer against the source without leaving the page.
+Omit `session_id` and the server mints one, naming the conversation from your first 48 characters. Every reply ships the top three passages it was built from as `{text, page}`, so you can check the answer against the source without leaving the page.
 
 ---
 
@@ -163,7 +166,9 @@ The two 🧪 folders are a **learning lab**, not app dependencies. They're the n
 "Refuses to guess" is a claim until it's measured. `evals/` holds a **54-question golden set** about the indexed paper, graded against the PDF itself:
 
 - **42 answerable questions** (definitions, method details, numbers, table lookups, metadata). Each one is pinned to its page and a verbatim evidence passage.
-- **12 unanswerable traps.** Some are plausible questions the paper never answers ("what batch size?"). Others are general knowledge the model already knows ("what is the capital of France?"). The only correct response is a refusal.
+- **12 unanswerable traps.** Some are plausible questions the paper never answers ("what weight decay?", "how does it do on MS MARCO?"). Others are general knowledge the model already knows ("what is the capital of France?"). The only correct response is a refusal.
+
+The indexed document is *[Dense Passage Retrieval for Open-Domain Question Answering](https://aclanthology.org/2020.emnlp-main.550/)* (Karpukhin et al., EMNLP 2020), redistributed under its [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) license. Swap in any PDF you like; the golden set is specific to this one.
 
 ```bash
 python -m evals.run_eval validate      # checks every evidence passage is really on its page
@@ -189,35 +194,43 @@ Full report: [`evals/results/retrieval.md`](evals/results/retrieval.md).
 
 | Config | Setup | Evidence hit@4 | MRR | Page hit@4 |
 |---|---|---|---|---|
-| **app (shipped)** | 1000/200 chunks, similarity top-4 | **83.3%** | **0.609** | **88.1%** |
-| mmr (previous default) | 1000/200 chunks, MMR λ=0.5 | 69.0% | 0.563 | 85.7% |
-| mmr-0.8 | 1000/200 chunks, MMR λ=0.8 | 76.2% | 0.591 | 83.3% |
-| small-chunks | 500/100 chunks, top-8 | 76.2% | 0.512 | 85.7% |
+| **app (shipped)** | 1000/200 chunks, similarity top-4 | **59.5%** | **0.429** | **83.3%** |
+| mmr (previous default) | 1000/200 chunks, MMR λ=0.5 | 42.9% | 0.367 | 73.8% |
+| mmr-0.8 | 1000/200 chunks, MMR λ=0.8 | 50.0% | 0.401 | 78.6% |
+| small-chunks | 500/100 chunks, similarity top-8 | 73.8% | 0.480 | 90.5% |
 
-The eval's first finding: **on this paper, MMR costs recall**, so NEURA now ships plain similarity. It finds the answering passage 14 points more often. MMR's diversity term pushes out the second-best chunk, and for pinpoint questions ("what loss function?", "which optimizer?") that chunk is often the one with the answer. Metadata questions (author, grant) miss under every config: the title-page chunk is dominated by the abstract.
+Two findings. **MMR costs recall**: its diversity term pushes out the second-best chunk, and for pinpoint questions that chunk is often the one with the answer, so NEURA ships plain similarity. **Smaller chunks find more**: 500-character chunks with top-8 reach 73.8% evidence hit, 14 points above the shipped setup, because the paper's dense tables and numbers get their own chunks instead of sharing one with surrounding prose. The answer eval for that config is still to run (it hit the Groq free tier's daily token limit), so the shipped config stays put until it's measured end to end. Metadata questions (conference, institutions) miss under every config: the title-page chunk is dominated by the author list and the abstract.
 
-Can the top retrieval score detect a question the document can't answer? The **AUROC is 0.71**: it separates them better than chance, but not well enough to refuse on the score alone yet.
+Can the top retrieval score detect a question the document can't answer? The **AUROC is 0.80** (0.83 with 500-character chunks): a useful signal, but not yet clean enough to refuse on the score alone.
 
 ### Current results: answers
 
-`gpt-oss-120b` on Groq, all 54 questions, faithfulness judged by `qwen3.8-27b`. Full reports: [similarity](evals/results/generation_similarity_groq_gpt-oss-120b.md) · [mmr](evals/results/generation_mmr_groq_gpt-oss-120b.md).
+`gpt-oss-120b` on Groq, all 54 questions, faithfulness judged by `qwen3.8-27b`. Full reports: [similarity](evals/results/generation_app_groq_gpt-oss-120b.md) · [mmr](evals/results/generation_mmr_groq_gpt-oss-120b.md).
 
 | Retrieval | Answer accuracy | Refusal accuracy | Hallucination rate | False refusals | Faithfulness |
 |---|---|---|---|---|---|
-| **similarity (shipped)** | **85.7%** | **100%** | **0%** | **9.5%** | 84.2% |
-| mmr (previous default) | 78.6% | **100%** | **0%** | 19.0% | 94.1% |
+| **similarity (shipped)** | **69.0%** | 83.3% | 16.7% | **21.4%** | **93.9%** |
+| mmr (previous default) | 61.9% | **91.7%** | **8.3%** | 26.2% | 90.3% |
 
-- **The refusal contract holds.** All 12 trap questions were refused under both configs, including general-knowledge ones the model knows the answer to ("what does self-attention compute?", "capital of France?").
-- **Every wrong answer traces back to retrieval.** In both runs, each miss happened because the answering passage never reached the model. When the passage was in context, the model got it right every time. Better search moves the score directly: similarity halves the false refusals.
-- **Faithfulness caveat.** The similarity run answers more questions, so more of its answers get judged. Of its 6 "unsupported" verdicts, 2 are real mistakes the judge caught (q01 names the wrong method, q21 invents a comparison). The other 4 are answers the keyword grading marked correct and still need a manual check.
+- **The refusal contract mostly holds, and its one crack is instructive.** Similarity refused 10 of 12 traps, MMR 11 of 12. Both misses are general-knowledge traps ("capital of France?", "boiling point of water?"). For those, retrieval returns the paper's Table 7, which contains a worked example: "What is the body of water between England and Ireland?". The model answers *that* question ("the Irish Sea") instead of refusing. It didn't invent a fact; a question-and-answer pair inside the document hijacked the answer. The prompt-level fix is on the roadmap.
+- **Every wrong answer traces back to retrieval.** In both runs, each miss happened because the answering passage never reached the model (13 misses with similarity, 16 with MMR). When the passage was in context, the model got it right every time, so better search moves the score directly.
+- **Faithfulness is high but not the whole story.** The judge finds 93.9% of the similarity run's answers fully supported by their context. A grounded answer to the wrong question, like the Table 7 case, still counts as supported, which is why refusal accuracy is measured separately.
 
-The graders are tested too. The first run scored some correct answers as wrong because the model writes non-breaking hyphens ("top‑k") and thin spaces ("21 015 324"). The normalizer now handles both, and `rescore` re-grades saved answers without calling the model again.
+The graders are tested too. The first run scored some correct answers as wrong because the model writes non-breaking hyphens ("top‑k") and thin spaces ("21 015 324"). The normalizer now handles both, and `rescore` re-grades saved answers without calling the model again.
 
 ---
 
 ## The frontend
 
-Particle-field canvas, aurora gradients, glassmorphism panels — written by hand in vanilla JS and CSS and served as one string from `app.py`. No React, no Tailwind, no bundler, no `node_modules`. Clone and run; there is no build step to break.
+Laid out like a listening-library dashboard: the paper is the library, each suggested question is a title on its shelf, and the composer is the player bar, whose progress track runs while NEURA retrieves and fills as the answer types out.
+
+- **Ask** shows nine real questions from the golden set as cards, each with an authored cover for its type (definition, method, numeric, table, trap) and a link that opens the PDF at the cited page.
+- **History** shows saved chats as cards with a preview of the latest answer.
+- **Evals** reads `evals/results/` through `/api/evals`, so the numbers on screen are the ones the repo can back up. The top bar repeats the headline (traps refused, answers correct).
+- **Document** describes the indexed paper and the pipeline settings, via `/api/info`.
+- Answers show their retrieved passages with page links; a refusal gets its own "Not in the document" state.
+
+Palette: ground `#16130E`, oxblood `#5B1408` (only on things you can press), rust `#9F2E10`, umber `#4B3F29`, amber `#E8892F`, apricot `#F1B978`. Hanken Grotesk for titles, Courier Prime for everything else, square corners, no gradients. Views are deep-linkable (`/#evals`, `/#doc`, `/#history`). It's written by hand in vanilla JS and CSS and served as one string from `app.py`. No React, no Tailwind, no bundler, no `node_modules`. Clone and run; there is no build step to break.
 
 ---
 
@@ -227,9 +240,10 @@ Being straight about what this does and doesn't do:
 
 - **One corpus at a time.** The PDF path is hardcoded in `create_database.py`; swapping documents means re-indexing. No multi-document routing.
 - **No streaming.** `/api/chat` blocks until the full generation returns, so long answers sit behind a spinner.
-- **Snippets, not citations.** Sources are the first 220 characters of each chunk — no page numbers or highlight-in-PDF.
+- **Snippets, not highlights.** Sources are the first 220 characters of each chunk with a link to its page; there is no highlight-in-PDF.
 - **No re-ranking.** The top-4 similarity results go straight to the prompt; a cross-encoder pass would sharpen them further.
-- **Some questions are out of retrieval's reach.** Author and grant questions miss under every config, because the title-page chunk is dominated by the abstract.
+- **Example Q&A in the document can hijack answers.** A worked question-and-answer pair in the indexed text can get answered in place of a refusal (see the eval).
+- **Some questions are out of retrieval's reach.** Metadata questions (which conference, which institutions) miss under every config, because the title-page chunk is dominated by the author list and the abstract.
 - **Local and unauthenticated.** Binds to `127.0.0.1` with no auth layer. Don't expose it as-is.
 
 ---
@@ -240,6 +254,8 @@ Being straight about what this does and doesn't do:
 - [ ] Multi-document indexing with per-source filters
 - [ ] Page-anchored citations that jump into the PDF
 - [ ] Cross-encoder re-ranking after retrieval (measured with `evals/`)
+- [ ] Refuse when the retrieved context answers a different question than the one asked
+- [ ] Answer-eval the 500/100 chunking and ship it if it wins end to end
 - [ ] Drag-and-drop upload + in-app re-indexing
 - [x] Swappable LLM backends: Groq, Hugging Face, or any OpenAI-compatible API
 
